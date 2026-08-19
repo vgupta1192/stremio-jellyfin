@@ -5,6 +5,12 @@ import {addonBuilder} from "stremio-addon-sdk"
 import {JellyfinApi, server} from "./jellyfin.js";
 import {manifest} from "./manifest.js";
 
+// Client-facing URLs (poster images, stream links) must use the publicly
+// reachable Jellyfin address, since they're opened by the Stremio client,
+// not by this addon's own server. Falls back to the internal server value
+// if no public address is configured.
+const publicServer = process.env.PUBLIC_JELLYFIN_SERVER || server
+
 const jellyfin = new JellyfinApi()
 await jellyfin.authenticate()
 
@@ -22,7 +28,7 @@ function itemToMeta(item) {
         id: item.ProviderIds.Imdb,
         type: item.Type.toLowerCase(),
         name: item.Name,
-        poster: `${server}/Items/${item.Id}/Images/Primary`
+        poster: `${publicServer}/Items/${item.Id}/Images/Primary`
     }
 }
 
@@ -34,9 +40,12 @@ builder.defineCatalogHandler(async ({type, id, extra}) => {
     })
 })
 
-builder.defineMetaHandler(({type, id}) => {
+builder.defineMetaHandler(async ({type, id}) => {
     console.log("request for meta: " + type + " " + id)
-    return Promise.resolve({meta: null})
+    const items = await jellyfin.getItemByImdbId(id)
+    if (items === undefined || items.length === 0)
+        return Promise.resolve({meta: null})
+    return Promise.resolve({meta: itemToMeta(items[0])})
 })
 
 builder.defineStreamHandler(async ({type, id}) => {
@@ -74,7 +83,7 @@ builder.defineStreamHandler(async ({type, id}) => {
 
     if (!(itemId === undefined)) {
         const stream = {
-            url: `${server}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${item.MediaSources[0].Id}`,
+            url: `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${item.MediaSources[0].Id}`,
             name: 'Jellyfin',
             description: item.MediaSources[0].MediaStreams[0].DisplayTitle
         }

@@ -65,13 +65,18 @@ export class JellyfinApi {
     }
 
      getItemByImdbId(imdbId) {
-        return axios.get(`${server}/ProvidersIdSearch?ProviderId=${imdbId}`,
+        // Native Jellyfin /Items API has no direct "find by external provider id" filter,
+        // so we search with Fields=ProviderIds and match client-side. This replaces the
+        // old jellyfin-providersid-search-plugin dependency, which is binary-incompatible
+        // with modern Jellyfin server versions (MissingMethodException on ILibraryManager).
+        return axios.get(`${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&Fields=ProviderIds,MediaSources`,
             {
                 headers: {
                     'Content-Type': 'application/json',
                     'X-Emby-Authorization': this.authorisationHeader
                 }
-            }).then(item => item.data)
+            })
+            .then(res => res.data.Items.filter(it => it.ProviderIds && it.ProviderIds.Imdb === imdbId))
     }
 
      getSeasonByParentItemIdAndSeasonNumber(itemId, seasonNumber) {
