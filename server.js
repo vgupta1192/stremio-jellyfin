@@ -120,16 +120,13 @@ app.get("/request/:type/:imdbId/:season?/:episode?", async (req, res) => {
             ))
         }
 
-        try {
-            await seerr.requestMedia(match.tmdbId, match.mediaType)
-        } catch (err) {
-            // 409 = already requested/available - not a real error, this is
-            // the expected case on every subsequent open of the same title
-            // while it's still downloading. Fall through to the placeholder.
-            if (err?.response?.status !== 409) {
-                throw err
-            }
-        }
+        // requestMedia() itself now guards against duplicates (an in-memory
+        // recent-request lock plus a live Seerr status check - see
+        // seerr.js), so it only throws for genuine failures now, returning
+        // normally (with alreadyRequested: true) for both "just requested"
+        // and "already requested" cases. Either way, fall through to
+        // serving the placeholder below.
+        await seerr.requestMedia(match.tmdbId, match.mediaType)
     } catch (err) {
         console.error("Seerr request failed:", err?.response?.data || err?.message || err)
         res.status(502)
