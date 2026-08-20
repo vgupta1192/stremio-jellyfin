@@ -32,14 +32,39 @@ export class JellyfinApi {
         this.authorisationHeader = `MediaBrowser Client="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0", Token="${this.auth.AccessToken}"`
     }
 
-    async getItemById(itemId) {
-        return axios.get(`${server}/Users/${this.auth.User.Id}/Items/${itemId}`,
-            {
+    // Jellyfin session tokens can be invalidated/rotated server-side at any
+    // time (server restart, session expiry, etc). Since authenticate() only
+    // ever runs once at process startup, every Jellyfin API call goes through
+    // this wrapper instead of calling axios.get directly: on a 401, it
+    // re-authenticates once (getting a fresh token + authorisationHeader)
+    // and retries the exact same request once before giving up. This lets
+    // the addon self-heal from a stale token without needing a manual
+    // service restart.
+    async authenticatedGet(url) {
+        try {
+            return await axios.get(url, {
                 headers: {
                     'Content-Type': 'application/json',
                     'X-Emby-Authorization': this.authorisationHeader
                 }
             })
+        } catch (err) {
+            if (err?.response?.status !== 401) {
+                throw err
+            }
+            console.warn("Jellyfin returned 401 - re-authenticating and retrying once.")
+            await this.authenticate()
+            return axios.get(url, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Emby-Authorization': this.authorisationHeader
+                }
+            })
+        }
+    }
+
+    async getItemById(itemId) {
+        return this.authenticatedGet(`${server}/Users/${this.auth.User.Id}/Items/${itemId}`)
     }
 
     async searchItems(skip, movie, searchTerm = null) {
@@ -54,13 +79,7 @@ export class JellyfinApi {
         } else
             itemsSearch += `&IncludeItemTypes=Series`
 
-        return axios.get(itemsSearch,
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Emby-Authorization': this.authorisationHeader
-                }
-            })
+        return this.authenticatedGet(itemsSearch)
             .then(it => it.data.Items.map(it => this.getItemById(it.Id)))
     }
 
@@ -69,33 +88,17 @@ export class JellyfinApi {
         // so we search with Fields=ProviderIds and match client-side. This replaces the
         // old jellyfin-providersid-search-plugin dependency, which is binary-incompatible
         // with modern Jellyfin server versions (MissingMethodException on ILibraryManager).
-        return axios.get(`${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&Fields=ProviderIds,MediaSources`,
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Emby-Authorization': this.authorisationHeader
-                }
-            })
+        return this.authenticatedGet(`${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&Fields=ProviderIds,MediaSources`)
             .then(res => res.data.Items.filter(it => it.ProviderIds && it.ProviderIds.Imdb === imdbId))
     }
 
      getSeasonByParentItemIdAndSeasonNumber(itemId, seasonNumber) {
-        return axios.get(`${server}/Shows/${itemId}/Seasons?userId=${this.auth.User.Id}`,
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Emby-Authorization': this.authorisationHeader
-                }
-            }).then(item => item.data)
+        return this.authenticatedGet(`${server}/Shows/${itemId}/Seasons?userId=${this.auth.User.Id}`)
+            .then(item => item.data)
     }
 
      getEpisodeByItemIdAndSeasonId(itemId, seasonId) {
-
-        return axios.get(`${server}/Shows/${itemId}/Episodes?seasonId=${seasonId}&userId=${this.auth.User.Id}`,
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Emby-Authorization': this.authorisationHeader                }
-            }).then(item => item.data)
+        return this.authenticatedGet(`${server}/Shows/${itemId}/Episodes?seasonId=${seasonId}&userId=${this.auth.User.Id}`)
+            .then(item => item.data)
     }
 }
