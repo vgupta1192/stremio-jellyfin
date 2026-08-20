@@ -43,7 +43,7 @@ export class JellyfinApi {
     }
 
     async searchItems(skip, movie, searchTerm = null) {
-        let firstItem = Number(skip) + 1
+        let firstItem = (Number(skip) || 0) + 1
         let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&startIndex=${firstItem}&limit=${itemsLimit}&sortBy=SortName`
         if (searchTerm) {
             itemsSearch += `&searchTerm=${searchTerm}`

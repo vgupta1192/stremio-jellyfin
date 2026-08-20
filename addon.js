@@ -36,7 +36,15 @@ builder.defineCatalogHandler(async ({type, id, extra}) => {
     console.log("request for catalogs: " + type + " " + id)
     return Promise.resolve({
         metas: await Promise.all(await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search))
-            .then(it => it.map(e => itemToMeta(e.data)))
+            .then(it => it.map(e => e.data))
+            // Jellyfin's hasImdb=true query param is not reliably enforced by the
+            // server (confirmed: items with no ProviderIds still come back), so
+            // filter client-side too. Every Stremio catalog meta object requires
+            // a non-empty `id` per spec; some third-party clients (e.g. Nuvio)
+            // reject the whole catalog response if any entry is missing one,
+            // whereas Stremio's own client silently tolerates it.
+            .then(items => items.filter(item => item.ProviderIds && item.ProviderIds.Imdb))
+            .then(items => items.map(itemToMeta))
     })
 })
 

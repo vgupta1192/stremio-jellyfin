@@ -5,10 +5,11 @@ export const manifest = {
         {
             "type": "movie",
             "id": "all",
+            "name": "Jellyfin Movies",
             "extra": [
                 {
                     "name": "skip",
-                    "isRequired": true
+                    "isRequired": false
                 },
                 {
                     "name": "search",
@@ -19,10 +20,11 @@ export const manifest = {
         {
             "type": "series",
             "id": "all",
+            "name": "Jellyfin Series",
             "extra": [
                 {
                     "name": "skip",
-                    "isRequired": true
+                    "isRequired": false
                 },
                 {
                     "name": "search",
