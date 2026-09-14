@@ -83,23 +83,23 @@ export class JellyfinApi {
         return this.authenticatedGet(`${server}/Users/${this.auth.User.Id}/Items/${itemId}`)
     }
 
-    // Fetches every Movie/Series in one shot (Fields=ProviderIds so the
-    // Imdb check below actually has data to look at - the list endpoint
+    // Fetches every Movie/Series in one shot (Fields=ProviderIds so
+    // itemToMeta in addon.js can tell which items have a matched IMDb id
+    // and which need the "jf<itemId>" fallback id - the list endpoint
     // omits ProviderIds entirely unless explicitly requested, unlike the
-    // single-item endpoint getItemById used to hit per item), filters to
-    // only items with a matched IMDb id (hasImdb=true is not reliably
-    // enforced server-side - confirmed live: identical result counts with
-    // and without it), THEN paginates. Filtering before paginating matters:
-    // slicing a fixed-size page of raw Jellyfin items *before* filtering
-    // (the previous approach) meant a page landing on a run of unmatched/
-    // junk titles in sort order came back almost empty even though plenty
-    // of valid items existed later in the list - this is what made the
-    // catalog look like it only had 3-4 titles when 77+ actually had IMDb
-    // ids. The whole library is small enough (~100-150 items) that fetching
-    // it in one request and paginating in memory is simpler and cheaper
-    // than the old per-item getItemById() N+1 calls it replaces.
-    // parentId scopes the search to one library (its Jellyfin ItemId) -
-    // omit it to search the whole server, as before.
+    // single-item endpoint getItemById used to hit per item), then
+    // paginates. No longer filters out items without an IMDb id (it used
+    // to, via hasImdb=true - which isn't reliably enforced server-side
+    // anyway, confirmed live: identical result counts with and without
+    // it): TheMovieDb fails to confidently match a meaningful fraction of
+    // real titles (most of Adult's library, some Shows), and those items
+    // were previously just invisible in every catalog rather than merely
+    // lacking IMDb-based extras. The whole library is small enough
+    // (~100-150 items) that fetching it in one request and paginating in
+    // memory is simpler and cheaper than the old per-item getItemById()
+    // N+1 calls it replaces. parentId scopes the search to one library
+    // (its Jellyfin ItemId) - omit it to search the whole server, as
+    // before.
     async searchItems(skip, movie, searchTerm = null, parentId = null) {
         let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&Recursive=true&Fields=ProviderIds&sortBy=SortName&IncludeItemTypes=${movie ? 'Movie' : 'Series'}`
         if (searchTerm) {
@@ -110,8 +110,7 @@ export class JellyfinApi {
         }
 
         return this.authenticatedGet(itemsSearch)
-            .then(it => it.data.Items.filter(item => item.ProviderIds && item.ProviderIds.Imdb))
-            .then(items => items.slice(Number(skip) || 0, (Number(skip) || 0) + itemsLimit))
+            .then(it => it.data.Items.slice(Number(skip) || 0, (Number(skip) || 0) + itemsLimit))
     }
 
      getItemByImdbId(imdbId) {
@@ -121,6 +120,26 @@ export class JellyfinApi {
         // with modern Jellyfin server versions (MissingMethodException on ILibraryManager).
         return this.authenticatedGet(`${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&Fields=ProviderIds,MediaSources`)
             .then(res => res.data.Items.filter(it => it.ProviderIds && it.ProviderIds.Imdb === imdbId))
+    }
+
+    // Fallback lookup for items with no matched external provider id (TheMovieDb
+    // couldn't confidently identify the title - common for adult content and
+    // obscure/mistitled files). Returns the same shape as getItemByImdbId (an
+    // array, so callers can keep doing items[0] either way) so it's a drop-in
+    // alternative, not a special case every caller needs to branch on.
+    getItemByJellyfinId(itemId) {
+        return this.getItemById(itemId).then(res => [res.data]).catch(() => [])
+    }
+
+    // Resolves a catalog item id that may be either a real IMDb id (tt-prefixed)
+    // or our own "jf<itemId>" fallback id (see itemToMeta in addon.js) - use this
+    // instead of getItemByImdbId anywhere a lookup used to assume every id was
+    // an IMDb id.
+    getItemByAnyId(id) {
+        if (id.startsWith('jf')) {
+            return this.getItemByJellyfinId(id.slice(2))
+        }
+        return this.getItemByImdbId(id)
     }
 
      getSeasonByParentItemIdAndSeasonNumber(itemId, seasonNumber) {

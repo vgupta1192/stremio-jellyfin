@@ -31,9 +31,14 @@ function stringToUuid(plainStringUuid) {
 
 let builder = new addonBuilder(manifest)
 
+// "jf<itemId>" fallback for items TheMovieDb couldn't confidently match to
+// an IMDb id (common for adult content and obscure/mistitled files) - see
+// getItemByAnyId in jellyfin.js for the corresponding lookup. No colon in
+// either form, so it never collides with the "seriesId:season:episode"
+// shape defineStreamHandler splits on below.
 function itemToMeta(item) {
     return {
-        id: item.ProviderIds.Imdb,
+        id: item.ProviderIds?.Imdb || `jf${item.Id}`,
         type: item.Type.toLowerCase(),
         name: item.Name,
         poster: `${publicServer}/Items/${item.Id}/Images/Primary`
@@ -66,7 +71,7 @@ builder.defineCatalogHandler(async ({type, id, extra}) => {
 
 builder.defineMetaHandler(async ({type, id}) => {
     console.log("request for meta: " + type + " " + id)
-    const items = await jellyfin.getItemByImdbId(id)
+    const items = await jellyfin.getItemByAnyId(id)
     if (items === undefined || items.length === 0)
         return Promise.resolve({meta: null})
     return Promise.resolve({meta: itemToMeta(items[0])})
@@ -142,11 +147,11 @@ export function buildJellyfinStreamUrl(item) {
 // clicked on is ready, not merely once the season starts appearing at all.
 export async function resolveJellyfinItem(type, imdbId, season, episode) {
     if (season === undefined || episode === undefined) {
-        const items = await jellyfin.getItemByImdbId(imdbId)
+        const items = await jellyfin.getItemByAnyId(imdbId)
         return (items && items.length > 0) ? items[0] : null
     }
 
-    const seriesItem = (await jellyfin.getItemByImdbId(imdbId))[0]
+    const seriesItem = (await jellyfin.getItemByAnyId(imdbId))[0]
     if (seriesItem === undefined) return null
     const seasonItem = (await jellyfin.getSeasonByParentItemIdAndSeasonNumber(seriesItem.Id, Number(season))).Items.find(it => it.IndexNumber === Number(season))
     if (seasonItem === undefined) return null
@@ -172,7 +177,7 @@ builder.defineStreamHandler(async ({type, id}) => {
         seasonNum = Number(resolvedId[1])
         episodeNum = Number(resolvedId[2])
 
-        const seriesItem = (await jellyfin.getItemByImdbId(seriesId))[0]
+        const seriesItem = (await jellyfin.getItemByAnyId(seriesId))[0]
         if (seriesItem === undefined) {
             const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
             return Promise.resolve({streams: requestStream ? [requestStream] : []})
@@ -192,7 +197,7 @@ builder.defineStreamHandler(async ({type, id}) => {
         items = [actualEpisodeItem]
 
     } else
-        items = await jellyfin.getItemByImdbId(id)
+        items = await jellyfin.getItemByAnyId(id)
 
     if (items === undefined || items.length === 0) {
         const requestStream = buildRequestStream(type, seriesImdbId || id, seasonNum, episodeNum)
