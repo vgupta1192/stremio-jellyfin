@@ -71,20 +71,30 @@ export class JellyfinApi {
         return this.authenticatedGet(`${server}/Users/${this.auth.User.Id}/Items/${itemId}`)
     }
 
+    // Fetches every Movie/Series in one shot (Fields=ProviderIds so the
+    // Imdb check below actually has data to look at - the list endpoint
+    // omits ProviderIds entirely unless explicitly requested, unlike the
+    // single-item endpoint getItemById used to hit per item), filters to
+    // only items with a matched IMDb id (hasImdb=true is not reliably
+    // enforced server-side - confirmed live: identical result counts with
+    // and without it), THEN paginates. Filtering before paginating matters:
+    // slicing a fixed-size page of raw Jellyfin items *before* filtering
+    // (the previous approach) meant a page landing on a run of unmatched/
+    // junk titles in sort order came back almost empty even though plenty
+    // of valid items existed later in the list - this is what made the
+    // catalog look like it only had 3-4 titles when 77+ actually had IMDb
+    // ids. The whole library is small enough (~100-150 items) that fetching
+    // it in one request and paginating in memory is simpler and cheaper
+    // than the old per-item getItemById() N+1 calls it replaces.
     async searchItems(skip, movie, searchTerm = null) {
-        let firstItem = (Number(skip) || 0) + 1
-        let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&startIndex=${firstItem}&limit=${itemsLimit}&sortBy=SortName`
+        let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&Recursive=true&Fields=ProviderIds&sortBy=SortName&IncludeItemTypes=${movie ? 'Movie' : 'Series'}`
         if (searchTerm) {
             itemsSearch += `&searchTerm=${searchTerm}`
         }
 
-        if (movie) {
-            itemsSearch += `&IncludeItemTypes=Movie`
-        } else
-            itemsSearch += `&IncludeItemTypes=Series`
-
         return this.authenticatedGet(itemsSearch)
-            .then(it => it.data.Items.map(it => this.getItemById(it.Id)))
+            .then(it => it.data.Items.filter(item => item.ProviderIds && item.ProviderIds.Imdb))
+            .then(items => items.slice(Number(skip) || 0, (Number(skip) || 0) + itemsLimit))
     }
 
      getItemByImdbId(imdbId) {
