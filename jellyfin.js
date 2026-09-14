@@ -7,6 +7,18 @@ const password = process.env.JELLYFIN_PASSWORD
 const device = os.hostname()
 const itemsLimit = 20
 
+// Library ItemIds used to scope catalog queries to a specific Jellyfin
+// library instead of the whole server - without this, e.g. the Adult
+// library's content (once given CollectionType=movies so it scans
+// properly) would also show up in the main "Jellyfin Movies" catalog,
+// since Items?IncludeItemTypes=Movie with no ParentId searches every
+// library at once. Undefined/unset just means "don't scope" (old
+// server-wide behavior), so this is safe to leave blank for setups
+// without a dedicated Adult library.
+export const moviesLibraryId = process.env.JELLYFIN_MOVIES_LIBRARY_ID
+export const showsLibraryId = process.env.JELLYFIN_SHOWS_LIBRARY_ID
+export const adultLibraryId = process.env.JELLYFIN_ADULT_LIBRARY_ID
+
 export class JellyfinApi {
 
     async authenticate() {
@@ -86,10 +98,15 @@ export class JellyfinApi {
     // ids. The whole library is small enough (~100-150 items) that fetching
     // it in one request and paginating in memory is simpler and cheaper
     // than the old per-item getItemById() N+1 calls it replaces.
-    async searchItems(skip, movie, searchTerm = null) {
+    // parentId scopes the search to one library (its Jellyfin ItemId) -
+    // omit it to search the whole server, as before.
+    async searchItems(skip, movie, searchTerm = null, parentId = null) {
         let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&Recursive=true&Fields=ProviderIds&sortBy=SortName&IncludeItemTypes=${movie ? 'Movie' : 'Series'}`
         if (searchTerm) {
             itemsSearch += `&searchTerm=${searchTerm}`
+        }
+        if (parentId) {
+            itemsSearch += `&ParentId=${parentId}`
         }
 
         return this.authenticatedGet(itemsSearch)

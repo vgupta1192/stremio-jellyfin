@@ -31,6 +31,21 @@ export const manifest = {
                     "isRequired": false
                 }
             ]
+        },
+        {
+            "type": "movie",
+            "id": "adult",
+            "name": "Adult",
+            "extra": [
+                {
+                    "name": "skip",
+                    "isRequired": false
+                },
+                {
+                    "name": "search",
+                    "isRequired": false
+                }
+            ]
         }
     ],
     "resources": [

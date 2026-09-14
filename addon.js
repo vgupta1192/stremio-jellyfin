@@ -2,7 +2,7 @@
 
 import Promise from "es6-promise"
 import {addonBuilder} from "stremio-addon-sdk"
-import {JellyfinApi, server} from "./jellyfin.js";
+import {JellyfinApi, server, moviesLibraryId, showsLibraryId, adultLibraryId} from "./jellyfin.js";
 import {manifest} from "./manifest.js";
 import {seerr} from "./seerr.js";
 
@@ -40,14 +40,26 @@ function itemToMeta(item) {
     }
 }
 
+// Scopes each catalog id to its own Jellyfin library, so e.g. the Adult
+// library's content (CollectionType=movies, so it scans/matches properly)
+// shows up only in its own "Adult" catalog and not also in "Jellyfin
+// Movies" - Items?IncludeItemTypes=Movie with no ParentId searches every
+// library on the server at once.
+const CATALOG_LIBRARY_IDS = {
+    'movie:all': moviesLibraryId,
+    'series:all': showsLibraryId,
+    'movie:adult': adultLibraryId,
+}
+
 builder.defineCatalogHandler(async ({type, id, extra}) => {
     console.log("request for catalogs: " + type + " " + id)
+    const parentId = CATALOG_LIBRARY_IDS[`${type}:${id}`]
     return Promise.resolve({
         // searchItems() now does its own Imdb filtering internally (on the
         // full, unpaginated list, before slicing to a page - see jellyfin.js)
         // and returns plain item objects directly, not axios responses, so
         // no .data unwrapping or re-filtering is needed here any more.
-        metas: (await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search))
+        metas: (await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId))
             .map(itemToMeta)
     })
 })
