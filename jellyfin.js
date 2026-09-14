@@ -15,7 +15,11 @@ export class JellyfinApi {
             {Username: user, Pw: password}, {
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-Emby-Authorization': `MediaBrowser Client="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0""`
+                    // Jellyfin 12+ (upgraded from 10.11) dropped support for the legacy
+                    // X-Emby-Authorization/X-Emby-Token headers entirely; it now requires
+                    // the standard Authorization header, still using the MediaBrowser
+                    // scheme, for both login and all authenticated requests.
+                    'Authorization': `MediaBrowser Client="Jellyfin Stremio Addon", App="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0"`
                 }
             }).then(it => it.data)
             .catch(err => {
@@ -29,7 +33,7 @@ export class JellyfinApi {
                 process.exit()
             })
         console.log(`Successfully connected to Jellyfin server: ${server}. Happy streaming.`)
-        this.authorisationHeader = `MediaBrowser Client="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0", Token="${this.auth.AccessToken}"`
+        this.authorisationHeader = `MediaBrowser Client="Jellyfin Stremio Addon", App="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0", Token="${this.auth.AccessToken}"`
     }
 
     // Jellyfin session tokens can be invalidated/rotated server-side at any
@@ -45,7 +49,7 @@ export class JellyfinApi {
             return await axios.get(url, {
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-Emby-Authorization': this.authorisationHeader
+                    'Authorization': this.authorisationHeader
                 }
             })
         } catch (err) {
@@ -57,7 +61,7 @@ export class JellyfinApi {
             return axios.get(url, {
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-Emby-Authorization': this.authorisationHeader
+                    'Authorization': this.authorisationHeader
                 }
             })
         }
