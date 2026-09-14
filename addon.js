@@ -45,6 +45,33 @@ function itemToMeta(item) {
     }
 }
 
+// For series, adds the "videos" (episode) list Stremio's UI needs to show
+// a season/episode picker instead of a bare "Play" button. A real IMDb-id
+// series gets this for free from Cinemeta (or another metadata addon that
+// recognizes "tt..." ids) merging its own richer response in - but nothing
+// else on earth recognizes our own "jf<itemId>" fallback ids, so for those
+// this addon is the *only* possible source of an episode list. Without it,
+// confirmed live: Stremio falls back to treating the whole series as one
+// single playable item, exactly like a movie.
+//
+// Built from getCanonicalEpisodeList so the video ids handed to the client
+// use the exact same season/episode numbering resolveEpisode expects back
+// in defineStreamHandler - they're built from the same source, so they
+// can't disagree with each other.
+async function buildDetailedMeta(item) {
+    const meta = itemToMeta(item)
+    if (item.Type !== 'Series') return meta
+    const episodes = await jellyfin.getCanonicalEpisodeList(item.Id)
+    meta.videos = episodes.map(({seasonNum, episodeNum, item: ep}) => ({
+        id: `${meta.id}:${seasonNum}:${episodeNum}`,
+        title: ep.Name || `Episode ${episodeNum}`,
+        season: seasonNum,
+        episode: episodeNum,
+        ...(ep.PremiereDate ? {released: ep.PremiereDate} : {})
+    }))
+    return meta
+}
+
 // Scopes each catalog id to its own Jellyfin library, so e.g. the Adult
 // library's content (CollectionType=movies, so it scans/matches properly)
 // shows up only in its own "Adult" catalog and not also in "Jellyfin
@@ -74,7 +101,7 @@ builder.defineMetaHandler(async ({type, id}) => {
     const items = await jellyfin.getItemByAnyId(id)
     if (items === undefined || items.length === 0)
         return Promise.resolve({meta: null})
-    return Promise.resolve({meta: itemToMeta(items[0])})
+    return Promise.resolve({meta: await buildDetailedMeta(items[0])})
 })
 
 // Builds the fallback "Request via Seerr" stream entry shown when a title
@@ -153,9 +180,7 @@ export async function resolveJellyfinItem(type, imdbId, season, episode) {
 
     const seriesItem = (await jellyfin.getItemByAnyId(imdbId))[0]
     if (seriesItem === undefined) return null
-    const seasonItem = (await jellyfin.getSeasonByParentItemIdAndSeasonNumber(seriesItem.Id, Number(season))).Items.find(it => it.IndexNumber === Number(season))
-    if (seasonItem === undefined) return null
-    const episodeItem = (await jellyfin.getEpisodeByItemIdAndSeasonId(seriesItem.Id, seasonItem.Id)).Items.find(it => it.IndexNumber === Number(episode))
+    const episodeItem = await jellyfin.resolveEpisode(seriesItem.Id, Number(season), Number(episode))
     if (episodeItem === undefined) return null
     return await jellyfin.getItemById(episodeItem.Id).then(it => it.data)
 }
@@ -182,12 +207,7 @@ builder.defineStreamHandler(async ({type, id}) => {
             const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
             return Promise.resolve({streams: requestStream ? [requestStream] : []})
         }
-        const seasonItem = (await jellyfin.getSeasonByParentItemIdAndSeasonNumber(seriesItem.Id, seasonNum)).Items.find(it => it.IndexNumber === seasonNum)
-        if (seasonItem === undefined) {
-            const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
-            return Promise.resolve({streams: requestStream ? [requestStream] : []})
-        }
-        const episodeItem = (await jellyfin.getEpisodeByItemIdAndSeasonId(seriesItem.Id, seasonItem.Id)).Items.find(it => it.IndexNumber === episodeNum)
+        const episodeItem = await jellyfin.resolveEpisode(seriesItem.Id, seasonNum, episodeNum)
         if (episodeItem === undefined) {
             const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
             return Promise.resolve({streams: requestStream ? [requestStream] : []})

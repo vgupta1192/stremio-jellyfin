@@ -142,13 +142,100 @@ export class JellyfinApi {
         return this.getItemByImdbId(id)
     }
 
-     getSeasonByParentItemIdAndSeasonNumber(itemId, seasonNumber) {
-        return this.authenticatedGet(`${server}/Shows/${itemId}/Seasons?userId=${this.auth.User.Id}`)
-            .then(item => item.data)
+    // Builds one canonical (season, episode) numbering for every episode of
+    // a series - the single source of truth both defineMetaHandler (the
+    // browsable episode list Stremio's UI needs) and resolveEpisode (given
+    // a season+episode, find the Jellyfin item) use, so they can never
+    // disagree with each other. Handles two real, confirmed-live messy-
+    // library cases beyond a normally-organized show (which just keeps its
+    // real season/episode IndexNumbers unchanged):
+    //
+    // - A season with no IndexNumber ("Season Unknown" - Jellyfin's
+    //   catch-all when it can't group episodes, common for a show scanned
+    //   without season subfolders past season 1) gets folded into one
+    //   synthetic season numbered one past the highest real season number,
+    //   with its episodes numbered positionally (sorted by premiere date,
+    //   then name). This won't always match the show's real season
+    //   breakdown (e.g. seasons 2-4 of a show all lumped into one "season"
+    //   here), but keeps every episode browsable and playable instead of
+    //   invisible - a deliberate, disclosed trade-off, not a guarantee of
+    //   matching official numbering.
+    // - If a season has episodes with no IndexNumber at all (e.g. named
+    //   after the release group/site instead of the real title, so
+    //   Jellyfin's parser had nothing to extract), those also fall back to
+    //   positional numbering within that season.
+    async getCanonicalEpisodeList(seriesId) {
+        const seasons = (await this.authenticatedGet(`${server}/Shows/${seriesId}/Seasons?userId=${this.auth.User.Id}`)).data.Items
+        const episodesFor = async (seasonId) =>
+            (await this.authenticatedGet(`${server}/Shows/${seriesId}/Episodes?seasonId=${seasonId}&userId=${this.auth.User.Id}`)).data.Items
+        const sortEpisodes = (episodes) => [...episodes].sort((a, b) =>
+            (a.PremiereDate || '').localeCompare(b.PremiereDate || '') || (a.Name || '').localeCompare(b.Name || '')
+        )
+
+        const numberedSeasons = seasons
+            .filter(s => s.IndexNumber !== null && s.IndexNumber !== undefined)
+            .sort((a, b) => a.IndexNumber - b.IndexNumber)
+        const unnumberedSeasons = seasons.filter(s => s.IndexNumber === null || s.IndexNumber === undefined)
+
+        const result = []
+
+        for (const season of numberedSeasons) {
+            const sorted = sortEpisodes(await episodesFor(season.Id))
+            // A real IndexNumber is only trustworthy if it's unique within
+            // this season - some messy batch releases (e.g. a "complete
+            // series + movies" torrent packaged as one item) give several
+            // unrelated files the same stray IndexNumber, which would
+            // otherwise collide into the same video id and hide all but one
+            // of them. Anything not uniquely numbered falls back to the
+            // next free positional slot instead, guaranteed not to clash
+            // with any real or already-assigned number in this season.
+            const indexCounts = {}
+            sorted.forEach(ep => {
+                if (ep.IndexNumber !== null && ep.IndexNumber !== undefined) {
+                    indexCounts[ep.IndexNumber] = (indexCounts[ep.IndexNumber] || 0) + 1
+                }
+            })
+            const usedNums = new Set()
+            let nextPositional = 1
+            sorted.forEach(item => {
+                const idx = item.IndexNumber
+                let episodeNum
+                // A real, uniquely-claimed index can still collide with a
+                // number an earlier item already took via the positional
+                // fallback below (order-dependent - the earlier item might
+                // sort first despite having no real index of its own), so
+                // usedNums has to be checked here too, not just in the
+                // fallback branch.
+                if (idx !== null && idx !== undefined && indexCounts[idx] === 1 && !usedNums.has(idx)) {
+                    episodeNum = idx
+                } else {
+                    while (usedNums.has(nextPositional)) nextPositional++
+                    episodeNum = nextPositional
+                }
+                usedNums.add(episodeNum)
+                result.push({seasonNum: season.IndexNumber, episodeNum, item})
+            })
+        }
+
+        if (unnumberedSeasons.length > 0) {
+            const syntheticSeasonNum = numberedSeasons.length > 0
+                ? numberedSeasons[numberedSeasons.length - 1].IndexNumber + 1
+                : 1
+            let extra = []
+            for (const season of unnumberedSeasons) {
+                extra = extra.concat(await episodesFor(season.Id))
+            }
+            sortEpisodes(extra).forEach((item, i) => {
+                result.push({seasonNum: syntheticSeasonNum, episodeNum: i + 1, item})
+            })
+        }
+
+        return result
     }
 
-     getEpisodeByItemIdAndSeasonId(itemId, seasonId) {
-        return this.authenticatedGet(`${server}/Shows/${itemId}/Episodes?seasonId=${seasonId}&userId=${this.auth.User.Id}`)
-            .then(item => item.data)
+    async resolveEpisode(seriesId, seasonNum, episodeNum) {
+        const list = await this.getCanonicalEpisodeList(seriesId)
+        const match = list.find(e => e.seasonNum === seasonNum && e.episodeNum === episodeNum)
+        return match ? match.item : undefined
     }
 }
