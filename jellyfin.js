@@ -101,7 +101,7 @@ export class JellyfinApi {
     // (its Jellyfin ItemId) - omit it to search the whole server, as
     // before.
     async searchItems(skip, movie, searchTerm = null, parentId = null) {
-        let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&Recursive=true&Fields=ProviderIds&sortBy=SortName&IncludeItemTypes=${movie ? 'Movie' : 'Series'}`
+        let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&Recursive=true&Fields=ProviderIds,ImageTags&sortBy=SortName&IncludeItemTypes=${movie ? 'Movie' : 'Series'}`
         if (searchTerm) {
             itemsSearch += `&searchTerm=${searchTerm}`
         }
@@ -118,7 +118,7 @@ export class JellyfinApi {
         // so we search with Fields=ProviderIds and match client-side. This replaces the
         // old jellyfin-providersid-search-plugin dependency, which is binary-incompatible
         // with modern Jellyfin server versions (MissingMethodException on ILibraryManager).
-        return this.authenticatedGet(`${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&Fields=ProviderIds,MediaSources`)
+        return this.authenticatedGet(`${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&Fields=ProviderIds,MediaSources,ImageTags`)
             .then(res => res.data.Items.filter(it => it.ProviderIds && it.ProviderIds.Imdb === imdbId))
     }
 
@@ -140,6 +140,24 @@ export class JellyfinApi {
             return this.getItemByJellyfinId(id.slice(2))
         }
         return this.getItemByImdbId(id)
+    }
+
+    // Fire-and-forget: asks Jellyfin to (re)fetch images for an item with
+    // no Primary image yet, so its own already-configured image fetchers
+    // (embedded cover extraction, TheMovieDb, and - as a last resort -
+    // "Screen Grabber", which pulls a frame directly from the video file)
+    // get a chance to run. Deliberately not awaited by callers: a poster
+    // showing up a request or two later is a fine outcome, and this must
+    // never block or fail the catalog/meta response it was triggered from.
+    // Silently swallows failures - a corrupted file ffmpeg can't open at
+    // all (confirmed live: some real files in this library are, via
+    // "moov atom not found") has nothing any of these fetchers can
+    // extract from, so this is a best-effort backfill that self-heals the
+    // fixable cases and stays a harmless no-op for the unfixable ones.
+    refreshItemImages(itemId) {
+        axios.post(`${server}/Items/${itemId}/Refresh?metadataRefreshMode=None&imageRefreshMode=FullRefresh&replaceAllImages=false`, null, {
+            headers: {'Authorization': this.authorisationHeader}
+        }).catch(() => {})
     }
 
     // Builds one canonical (season, episode) numbering for every episode of

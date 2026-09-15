@@ -31,17 +31,37 @@ function stringToUuid(plainStringUuid) {
 
 let builder = new addonBuilder(manifest)
 
+// Tracks which items have already had a background image refresh
+// triggered this process lifetime, so a catalog page rendered repeatedly
+// (every poll/scroll) doesn't re-request one every single time - one
+// attempt per item per restart is enough to either pick up a fix or
+// confirm there's nothing to extract.
+const imageRefreshTriggered = new Set()
+
 // "jf<itemId>" fallback for items TheMovieDb couldn't confidently match to
 // an IMDb id (common for adult content and obscure/mistitled files) - see
 // getItemByAnyId in jellyfin.js for the corresponding lookup. No colon in
 // either form, so it never collides with the "seriesId:season:episode"
 // shape defineStreamHandler splits on below.
 function itemToMeta(item) {
+    const hasPoster = !!item.ImageTags?.Primary
+    // Omitting `poster` entirely (rather than pointing at an Images/Primary
+    // URL that 404s) lets Stremio's own UI fall back to its normal
+    // no-poster placeholder instead of a broken black box - confirmed live
+    // this was rendering as pitch black for items with no Primary image.
+    // Kick off a one-time background refresh so Jellyfin's own image
+    // fetchers (including a screen-grab from the video as a last resort)
+    // get a chance to backfill a real poster for any future item this
+    // happens to - see refreshItemImages in jellyfin.js.
+    if (!hasPoster && !imageRefreshTriggered.has(item.Id)) {
+        imageRefreshTriggered.add(item.Id)
+        jellyfin.refreshItemImages(item.Id)
+    }
     return {
         id: item.ProviderIds?.Imdb || `jf${item.Id}`,
         type: item.Type.toLowerCase(),
         name: item.Name,
-        poster: `${publicServer}/Items/${item.Id}/Images/Primary`
+        ...(hasPoster ? {poster: `${publicServer}/Items/${item.Id}/Images/Primary`} : {})
     }
 }
 
