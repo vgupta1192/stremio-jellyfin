@@ -3,7 +3,7 @@
 import Promise from "es6-promise"
 import {addonBuilder} from "stremio-addon-sdk"
 import {JellyfinApi, server, moviesLibraryId, showsLibraryId, adultLibraryId} from "./jellyfin.js";
-import {manifest} from "./manifest.js";
+import {createManifest} from "./manifest.js";
 import {seerr} from "./seerr.js";
 
 // Client-facing URLs (poster images, stream links) must use the publicly
@@ -28,8 +28,6 @@ function stringToUuid(plainStringUuid) {
         "$1-$2-$3-$4-$5"
     )
 }
-
-let builder = new addonBuilder(manifest)
 
 // Tracks which items have already had a background image refresh
 // triggered this process lifetime, so a catalog page rendered repeatedly
@@ -102,27 +100,6 @@ const CATALOG_LIBRARY_IDS = {
     'series:all': showsLibraryId,
     'movie:adult': adultLibraryId,
 }
-
-builder.defineCatalogHandler(async ({type, id, extra}) => {
-    console.log("request for catalogs: " + type + " " + id)
-    const parentId = CATALOG_LIBRARY_IDS[`${type}:${id}`]
-    return Promise.resolve({
-        // searchItems() now does its own Imdb filtering internally (on the
-        // full, unpaginated list, before slicing to a page - see jellyfin.js)
-        // and returns plain item objects directly, not axios responses, so
-        // no .data unwrapping or re-filtering is needed here any more.
-        metas: (await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId))
-            .map(itemToMeta)
-    })
-})
-
-builder.defineMetaHandler(async ({type, id}) => {
-    console.log("request for meta: " + type + " " + id)
-    const items = await jellyfin.getItemByAnyId(id)
-    if (items === undefined || items.length === 0)
-        return Promise.resolve({meta: null})
-    return Promise.resolve({meta: await buildDetailedMeta(items[0])})
-})
 
 // Builds the fallback "Request via Seerr" stream entry shown when a title
 // isn't in the Jellyfin library yet.
@@ -209,7 +186,39 @@ export async function resolveJellyfinItem(type, imdbId, season, episode) {
 
 export {jellyfin}
 
-builder.defineStreamHandler(async ({type, id}) => {
+// Builds a complete addon interface for one manifest variant. Both variants
+// (with/without the Adult catalog - see manifest.js) share every handler
+// unchanged: the catalog handler is already driven purely by the requested
+// catalog `id`, and Stremio only ever requests a catalog id that's actually
+// listed in whichever manifest it fetched - so the "no adult" variant's
+// client simply never asks for id: "adult" in the first place, with no
+// extra branching needed here.
+function buildInterface(showAdult) {
+    const builder = new addonBuilder(createManifest(showAdult))
+
+    builder.defineCatalogHandler(async ({type, id, extra}) => {
+        console.log("request for catalogs: " + type + " " + id)
+        const parentId = CATALOG_LIBRARY_IDS[`${type}:${id}`]
+        return Promise.resolve({
+            // searchItems() now does its own Imdb filtering internally (on
+            // the full, unpaginated list, before slicing to a page - see
+            // jellyfin.js) and returns plain item objects directly, not
+            // axios responses, so no .data unwrapping or re-filtering is
+            // needed here any more.
+            metas: (await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId))
+                .map(itemToMeta)
+        })
+    })
+
+    builder.defineMetaHandler(async ({type, id}) => {
+        console.log("request for meta: " + type + " " + id)
+        const items = await jellyfin.getItemByAnyId(id)
+        if (items === undefined || items.length === 0)
+            return Promise.resolve({meta: null})
+        return Promise.resolve({meta: await buildDetailedMeta(items[0])})
+    })
+
+    builder.defineStreamHandler(async ({type, id}) => {
     console.log("request for streams: " + type + " " + id)
     let items = []
     let seriesImdbId = null
@@ -275,6 +284,14 @@ builder.defineStreamHandler(async ({type, id}) => {
     console.log(`Cant find stream for: ${id}`)
     const requestStream = buildRequestStream(type, seriesImdbId || id, seasonNum, episodeNum)
     return Promise.resolve({streams: requestStream ? [requestStream] : []})
-})
+    })
 
-export const addonInterface = builder.getInterface()
+    return builder.getInterface()
+}
+
+// Two genuinely separate installable addons (distinct manifest ids - see
+// createManifest) sharing every handler - see server.js for how each is
+// mounted under its own URL prefix, and the /configure page that lets the
+// user pick which one to install.
+export const addonInterfaceFull = buildInterface(true)
+export const addonInterfaceNoAdult = buildInterface(false)
