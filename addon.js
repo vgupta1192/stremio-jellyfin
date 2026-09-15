@@ -3,7 +3,7 @@
 import Promise from "es6-promise"
 import {addonBuilder} from "stremio-addon-sdk"
 import {JellyfinApi, server, moviesLibraryId, showsLibraryId, adultLibraryId} from "./jellyfin.js";
-import {createManifest} from "./manifest.js";
+import {createManifest, configToSlug, ALL_CONFIGS} from "./manifest.js";
 import {seerr} from "./seerr.js";
 
 // Client-facing URLs (poster images, stream links) must use the publicly
@@ -35,6 +35,17 @@ function stringToUuid(plainStringUuid) {
 // attempt per item per restart is enough to either pick up a fix or
 // confirm there's nothing to extract.
 const imageRefreshTriggered = new Set()
+
+// Stremio's stream/meta requests carry only a content id, never which
+// catalog the user found it through - so there's no direct way for
+// defineStreamHandler below to know "this id is Adult content" when
+// deciding whether to offer a Request-via-Seerr fallback. Populated by the
+// catalog handler every time the Adult catalog is listed (which happens
+// before a user could ever click into a title from it), so by the time a
+// stream request for one of these ids arrives, it's already known here.
+// Shared across every config/interface (see buildInterface) since it's a
+// fact about the id itself, not about which addon variant is asking.
+const adultItemIds = new Set()
 
 // "jf<itemId>" fallback for items TheMovieDb couldn't confidently match to
 // an IMDb id (common for adult content and obscure/mistitled files) - see
@@ -125,6 +136,12 @@ const CATALOG_LIBRARY_IDS = {
 // series - movies keep the plain /request/movie/:imdbId shape.
 function buildRequestStream(type, imdbId, season, episode) {
     if (!seerr.enabled) return null
+    // Never offer to request Adult content through Seerr - it's a
+    // mainstream movie/TV request system (backed by Radarr/Sonarr via
+    // TMDb), not something that makes sense to point at this library. See
+    // adultItemIds above for how this is known without needing the item to
+    // still exist in Jellyfin.
+    if (adultItemIds.has(imdbId)) return null
     const path = (season !== undefined && episode !== undefined)
         ? `/request/${type}/${imdbId}/${season}/${episode}`
         : `/request/${type}/${imdbId}`
@@ -186,28 +203,39 @@ export async function resolveJellyfinItem(type, imdbId, season, episode) {
 
 export {jellyfin}
 
-// Builds a complete addon interface for one manifest variant. Both variants
-// (with/without the Adult catalog - see manifest.js) share every handler
-// unchanged: the catalog handler is already driven purely by the requested
-// catalog `id`, and Stremio only ever requests a catalog id that's actually
-// listed in whichever manifest it fetched - so the "no adult" variant's
-// client simply never asks for id: "adult" in the first place, with no
-// extra branching needed here.
-function buildInterface(showAdult) {
-    const builder = new addonBuilder(createManifest(showAdult))
+// Exposed so server.js's /request route (the actual URL a player opens for
+// the "Request via Seerr" stream) can also refuse to submit an Adult id,
+// in case a client ever holds onto a stale stream URL from before this
+// content was correctly excluded at the point streams are built above.
+export function isAdultItemId(id) {
+    return adultItemIds.has(id)
+}
+
+// Builds a complete addon interface for one config (which of Movies/
+// Series/Adult are enabled - see manifest.js). Every config shares every
+// handler unchanged: the catalog handler is already driven purely by the
+// requested catalog `type`/`id` via CATALOG_LIBRARY_IDS, and Stremio only
+// ever requests a catalog id that's actually listed in whichever manifest
+// it fetched - so a config with a given catalog disabled simply never
+// gets asked for it in the first place, with no extra branching needed
+// here.
+function buildInterface(config) {
+    const builder = new addonBuilder(createManifest(config))
 
     builder.defineCatalogHandler(async ({type, id, extra}) => {
         console.log("request for catalogs: " + type + " " + id)
         const parentId = CATALOG_LIBRARY_IDS[`${type}:${id}`]
-        return Promise.resolve({
-            // searchItems() now does its own Imdb filtering internally (on
-            // the full, unpaginated list, before slicing to a page - see
-            // jellyfin.js) and returns plain item objects directly, not
-            // axios responses, so no .data unwrapping or re-filtering is
-            // needed here any more.
-            metas: (await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId))
-                .map(itemToMeta)
-        })
+        // searchItems() now does its own Imdb filtering internally (on
+        // the full, unpaginated list, before slicing to a page - see
+        // jellyfin.js) and returns plain item objects directly, not
+        // axios responses, so no .data unwrapping or re-filtering is
+        // needed here any more.
+        const items = await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId)
+        const metas = items.map(itemToMeta)
+        if (id === 'adult') {
+            metas.forEach(m => adultItemIds.add(m.id))
+        }
+        return Promise.resolve({metas})
     })
 
     builder.defineMetaHandler(async ({type, id}) => {
@@ -289,9 +317,14 @@ function buildInterface(showAdult) {
     return builder.getInterface()
 }
 
-// Two genuinely separate installable addons (distinct manifest ids - see
-// createManifest) sharing every handler - see server.js for how each is
-// mounted under its own URL prefix, and the /configure page that lets the
-// user pick which one to install.
-export const addonInterfaceFull = buildInterface(true)
-export const addonInterfaceNoAdult = buildInterface(false)
+// One interface per config (all 2^3 = 8 combinations of Movies/Series/
+// Adult - see manifest.js), each a genuinely separate installable addon
+// (distinct manifest id) sharing every handler - see server.js for how
+// each is mounted under its own URL prefix (or the root, for the
+// everything-enabled default), and the /configure page that lets the user
+// pick which one to install. Keyed by slug ("" for the root/all-enabled
+// config) so server.js can look up the right interface for each mount
+// point without rebuilding it.
+export const interfacesBySlug = new Map(
+    ALL_CONFIGS.map(config => [configToSlug(config) || "", buildInterface(config)])
+)
