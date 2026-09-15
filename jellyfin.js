@@ -178,6 +178,7 @@ export class JellyfinApi {
         const unnumberedSeasons = seasons.filter(s => s.IndexNumber === null || s.IndexNumber === undefined)
 
         const result = []
+        let fallbackNumbered = 0
 
         for (const season of numberedSeasons) {
             const sorted = sortEpisodes(await episodesFor(season.Id))
@@ -211,6 +212,7 @@ export class JellyfinApi {
                 } else {
                     while (usedNums.has(nextPositional)) nextPositional++
                     episodeNum = nextPositional
+                    fallbackNumbered++
                 }
                 usedNums.add(episodeNum)
                 result.push({seasonNum: season.IndexNumber, episodeNum, item})
@@ -228,6 +230,11 @@ export class JellyfinApi {
             sortEpisodes(extra).forEach((item, i) => {
                 result.push({seasonNum: syntheticSeasonNum, episodeNum: i + 1, item})
             })
+            console.warn(`[episode-numbering] ${seriesId}: ${unnumberedSeasons.map(s => s.Name).join(', ')} (${extra.length} episodes with no season number) folded into synthetic season ${syntheticSeasonNum}, numbered positionally - won't necessarily match this show's real season breakdown, but every episode stays browsable and playable. Fix at the source by fixing file/folder naming and re-scanning, if the real season split matters here.`)
+        }
+
+        if (fallbackNumbered > 0) {
+            console.warn(`[episode-numbering] ${seriesId}: ${fallbackNumbered} episode(s) had no usable or unique IndexNumber within their season and were numbered positionally (by premiere date/name) instead - a best-effort guess, not guaranteed to match the real episode order. Fix at the source by fixing file naming and re-scanning, if exact accuracy matters here.`)
         }
 
         return result

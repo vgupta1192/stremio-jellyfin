@@ -161,7 +161,9 @@ function buildRequestStream(type, imdbId, season, episode) {
 export function buildJellyfinStreamUrl(item) {
     const itemId = stringToUuid(item.Id)
     if (itemId === undefined) return null
-    return `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${item.MediaSources[0].Id}`
+    const mediaSource = item.MediaSources?.[0]
+    if (!mediaSource) return null
+    return `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${mediaSource.Id}`
 }
 
 // Resolves a movie or specific episode's Jellyfin item, mirroring the same
@@ -226,12 +228,26 @@ builder.defineStreamHandler(async ({type, id}) => {
 
     const item = items[0]
     const itemId = stringToUuid(item.Id)
+    // MediaStreams (per-track technical info: resolution/codec/language)
+    // can be empty even when MediaSources itself is populated - e.g. a
+    // file Jellyfin's ffprobe hasn't finished analyzing, or errored on -
+    // confirmed live on real, otherwise-playable files (6 across the
+    // Movies/Adult libraries). That's cosmetic only (the stream label),
+    // not a reason to treat an actually-playable file as unavailable, so
+    // it falls back to the item's own name instead of crashing the whole
+    // request - unlike a missing MediaSources entry entirely, which does
+    // mean there's no real file to play and correctly falls through to
+    // the "not found" / Request-via-Seerr path below.
+    const mediaSource = item.MediaSources?.[0]
 
-    if (!(itemId === undefined)) {
+    if (itemId !== undefined && mediaSource) {
+        if (!mediaSource.MediaStreams?.[0]) {
+            console.warn(`[stream-fallback] ${item.Name} (${item.Id}): MediaSources present but MediaStreams empty - Jellyfin likely hasn't finished (or failed) probing this file's technical details. Still playable, just using the item's name as the stream label instead of resolution/codec info. Fix at the source by re-running metadata refresh on this item, if the label matters here.`)
+        }
         const stream = {
-            url: `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${item.MediaSources[0].Id}`,
+            url: `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${mediaSource.Id}`,
             name: 'Jellyfin',
-            description: item.MediaSources[0].MediaStreams[0].DisplayTitle
+            description: mediaSource.MediaStreams?.[0]?.DisplayTitle || item.Name
         }
         return Promise.resolve({streams: [stream]})
     }
