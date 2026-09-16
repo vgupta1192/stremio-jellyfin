@@ -1,5 +1,7 @@
 // noinspection JSPotentiallyInvalidConstructorUsage
 
+import fs from "fs"
+import path from "path"
 import Promise from "es6-promise"
 import {addonBuilder} from "stremio-addon-sdk"
 import {JellyfinApi, server, moviesLibraryId, showsLibraryId, adultLibraryId} from "./jellyfin.js";
@@ -40,12 +42,40 @@ const imageRefreshTriggered = new Set()
 // catalog the user found it through - so there's no direct way for
 // defineStreamHandler below to know "this id is Adult content" when
 // deciding whether to offer a Request-via-Seerr fallback. Populated by the
-// catalog handler every time the Adult catalog is listed (which happens
-// before a user could ever click into a title from it), so by the time a
-// stream request for one of these ids arrives, it's already known here.
-// Shared across every config/interface (see buildInterface) since it's a
-// fact about the id itself, not about which addon variant is asking.
-const adultItemIds = new Set()
+// catalog handler every time the Adult catalog is listed. Shared across
+// every config/interface (see buildInterface) since it's a fact about the
+// id itself, not about which addon variant is asking.
+//
+// Persisted to disk (confirmed live, 2026-09-16): this used to be
+// in-memory only, on the assumption that the Adult catalog would always
+// get listed again before a user could click into a title from it within
+// the same process lifetime. That assumption broke on every restart of
+// this addon (log rotation, deploys, etc. all restart it periodically) -
+// a title already known to be Adult from a browse *before* the restart
+// lost that protection the moment the process restarted, since the Set
+// came back empty and Stremio doesn't necessarily re-list the catalog
+// before reopening a title it already has cached client-side. Loading/
+// saving this same Set to a small JSON file means the exclusion survives
+// restarts, not just the current process's uptime.
+const ADULT_ITEM_IDS_FILE = path.join(process.cwd(), "data", "adult-item-ids.json")
+const adultItemIds = new Set(loadAdultItemIds())
+
+function loadAdultItemIds() {
+    try {
+        return JSON.parse(fs.readFileSync(ADULT_ITEM_IDS_FILE, "utf8"))
+    } catch {
+        return []
+    }
+}
+
+function saveAdultItemIds() {
+    try {
+        fs.mkdirSync(path.dirname(ADULT_ITEM_IDS_FILE), {recursive: true})
+        fs.writeFileSync(ADULT_ITEM_IDS_FILE, JSON.stringify([...adultItemIds]))
+    } catch (err) {
+        console.error("Failed to persist adultItemIds:", err?.message || err)
+    }
+}
 
 // "jf<itemId>" fallback for items TheMovieDb couldn't confidently match to
 // an IMDb id (common for adult content and obscure/mistitled files) - see
@@ -233,7 +263,9 @@ function buildInterface(config) {
         const items = await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId)
         const metas = items.map(itemToMeta)
         if (id === 'adult') {
+            const sizeBefore = adultItemIds.size
             metas.forEach(m => adultItemIds.add(m.id))
+            if (adultItemIds.size !== sizeBefore) saveAdultItemIds()
         }
         return Promise.resolve({metas})
     })
