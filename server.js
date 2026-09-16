@@ -2,7 +2,7 @@ import path from "path"
 import { fileURLToPath } from "url"
 import express from "express"
 import stremio from "stremio-addon-sdk"
-import {interfacesBySlug, buildJellyfinStreamUrl, resolveJellyfinItem, isAdultItemId} from "./addon.js"
+import {interfacesBySlug, buildJellyfinStreamUrl, resolveJellyfinItem, isRequestableItemId} from "./addon.js"
 import {ALL_CONFIGS, configToSlug} from "./manifest.js"
 import {seerr} from "./seerr.js"
 
@@ -216,16 +216,18 @@ app.get("/request/:type/:imdbId/:season?/:episode?", async (req, res) => {
         ))
     }
 
-    // Belt-and-suspenders: defineStreamHandler never offers this URL for
-    // Adult content in the first place (see isAdultItemId in addon.js),
-    // but refuse here too in case a client held onto a stale stream URL
-    // from before that exclusion took effect.
-    if (isAdultItemId(imdbId)) {
+    // Belt-and-suspenders: defineStreamHandler never offers this URL
+    // unless the id is known, catalogued mainstream Jellyfin content (see
+    // isRequestableItemId in addon.js) - not Adult content, and not an id
+    // from some other addon entirely - but refuse here too in case a
+    // client held onto a stale stream URL from before that exclusion
+    // took effect.
+    if (!isRequestableItemId(imdbId)) {
         res.status(403)
         res.setHeader("content-type", "text/html; charset=utf-8")
         return res.end(renderErrorPage(
             "Not requestable",
-            "Adult content isn't submitted to Seerr."
+            "This title isn't recognized as requestable mainstream Jellyfin content."
         ))
     }
 
