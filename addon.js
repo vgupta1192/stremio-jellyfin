@@ -43,43 +43,52 @@ const imageRefreshTriggered = new Set()
 // content id from a completely unrelated addon's catalog (confirmed live,
 // 2026-09-16: an "OnlyPorn" addon) reaches this addon's stream handler
 // exactly the same as one from this addon's own Movie/Series catalogs.
-// Blacklisting "known Adult ids" (the previous approach) only ever
-// protected ids this addon's own Adult catalog had listed - it did
-// nothing for ids sourced from any other addon, which then fell through
-// to the default "offer Seerr" behavior since they simply weren't on the
-// blacklist. Seerr should only ever be offered for a title this addon
-// actually knows is legitimate, catalogued Jellyfin movie/series content
-// that just isn't downloaded yet - so this whitelists that instead:
-// populated by the catalog handler every time the Movie or Series
-// (non-Adult) catalog is listed, and buildRequestStream only offers Seerr
-// for an id that's actually in this set. Anything not seen via this
-// addon's own mainstream catalogs - Adult content, or any id from a
-// completely different addon - is excluded by construction, not by
-// trying to enumerate every case that shouldn't be offered. Shared
-// across every config/interface (see buildInterface) since it's a fact
-// about the id itself, not about which addon variant is asking.
+//
+// A whitelist populated only from titles this addon's own catalog has
+// listed (tried right after the above bug) turned out to be broken for the
+// opposite reason: buildRequestStream only ever runs when a title is NOT
+// found in Jellyfin, but the catalog handler only ever lists titles that
+// ARE already in Jellyfin - so a genuinely missing movie/series (exactly
+// the case Seerr exists for) could never get onto that whitelist in the
+// first place, silently breaking Seerr for every not-yet-downloaded title,
+// confirmed live 2026-09-16.
+//
+// So this is a blacklist again, but a narrower one than the original:
+// adultItemIds (ids seen via this addon's own Adult catalog) covers this
+// addon's own adult content, and isRequestableItemId additionally requires
+// a real "tt<digits>" IMDb id shape. That second check is what closes the
+// OnlyPorn-style leak: Seerr's own lookup (seerr.findByImdbId) only ever
+// works from a real IMDb id anyway, so a non-"tt" id from some other
+// addon's own custom id scheme was never going to resolve on Seerr even
+// before this fix - excluding it here isn't a functionality loss, and it
+// also happens to be the only titles a foreign adult addon would plausibly
+// send (adult content is essentially never IMDb-catalogued). Genuine
+// mainstream movies/series - from this addon's own catalogs or any other
+// addon - keep working via their real "tt" id, matching every catalog they
+// might be browsed from.
 //
 // Persisted to disk: in-memory-only tracking doesn't survive this addon's
 // own periodic restarts (log rotation, deploys), and Stremio doesn't
 // necessarily re-list a catalog before reopening a title it already has
 // cached client-side - see the 2026-09-16 incident this replaces.
-const REQUESTABLE_ITEM_IDS_FILE = path.join(process.cwd(), "data", "requestable-item-ids.json")
-const requestableItemIds = new Set(loadRequestableItemIds())
+const ADULT_ITEM_IDS_FILE = path.join(process.cwd(), "data", "adult-item-ids.json")
+const adultItemIds = new Set(loadAdultItemIds())
+const IMDB_ID_RE = /^tt\d+$/
 
-function loadRequestableItemIds() {
+function loadAdultItemIds() {
     try {
-        return JSON.parse(fs.readFileSync(REQUESTABLE_ITEM_IDS_FILE, "utf8"))
+        return JSON.parse(fs.readFileSync(ADULT_ITEM_IDS_FILE, "utf8"))
     } catch {
         return []
     }
 }
 
-function saveRequestableItemIds() {
+function saveAdultItemIds() {
     try {
-        fs.mkdirSync(path.dirname(REQUESTABLE_ITEM_IDS_FILE), {recursive: true})
-        fs.writeFileSync(REQUESTABLE_ITEM_IDS_FILE, JSON.stringify([...requestableItemIds]))
+        fs.mkdirSync(path.dirname(ADULT_ITEM_IDS_FILE), {recursive: true})
+        fs.writeFileSync(ADULT_ITEM_IDS_FILE, JSON.stringify([...adultItemIds]))
     } catch (err) {
-        console.error("Failed to persist requestableItemIds:", err?.message || err)
+        console.error("Failed to persist adultItemIds:", err?.message || err)
     }
 }
 
@@ -172,14 +181,10 @@ const CATALOG_LIBRARY_IDS = {
 // series - movies keep the plain /request/movie/:imdbId shape.
 function buildRequestStream(type, imdbId, season, episode) {
     if (!seerr.enabled) return null
-    // Only offer to request a title through Seerr if it's known, legitimate
-    // mainstream Jellyfin movie/series content - never Adult content, and
-    // never an id this addon never saw via its own catalogs at all (e.g.
-    // one from a completely different addon, forwarded here by Stremio
-    // regardless of which addon's catalog surfaced it). See
-    // requestableItemIds above for how this is known without needing the
-    // item to still exist in Jellyfin.
-    if (!requestableItemIds.has(imdbId)) return null
+    // Only offer to request a title through Seerr if it's a real IMDb id
+    // and not known Adult content - see isRequestableItemId above for why
+    // both checks are needed.
+    if (!isRequestableItemId(imdbId)) return null
     const path = (season !== undefined && episode !== undefined)
         ? `/request/${type}/${imdbId}/${season}/${episode}`
         : `/request/${type}/${imdbId}`
@@ -244,11 +249,11 @@ export {jellyfin}
 // Exposed so server.js's /request route (the actual URL a player opens for
 // the "Request via Seerr" stream) can also refuse to submit an id this
 // addon never actually offered Seerr for in the first place (Adult
-// content, or any id from a completely different addon), in case a
+// content, or a non-IMDb id from a completely different addon), in case a
 // client ever holds onto a stale stream URL from before that exclusion
 // took effect.
 export function isRequestableItemId(id) {
-    return requestableItemIds.has(id)
+    return IMDB_ID_RE.test(id) && !adultItemIds.has(id)
 }
 
 // Builds a complete addon interface for one config (which of Movies/
@@ -272,14 +277,13 @@ function buildInterface(config) {
         // needed here any more.
         const items = await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId)
         const metas = items.map(itemToMeta)
-        // Only the mainstream (Movie/Series) catalogs mark ids as
-        // Seerr-requestable - explicitly NOT the Adult catalog. See
-        // requestableItemIds above for why this is a whitelist rather than
-        // an Adult-specific blacklist.
-        if (id !== 'adult') {
-            const sizeBefore = requestableItemIds.size
-            metas.forEach(m => requestableItemIds.add(m.id))
-            if (requestableItemIds.size !== sizeBefore) saveRequestableItemIds()
+        // Only the Adult catalog marks ids as known-adult (blacklisted from
+        // Seerr) - see adultItemIds above for why this is a blacklist
+        // rather than a mainstream-catalog whitelist.
+        if (id === 'adult') {
+            const sizeBefore = adultItemIds.size
+            metas.forEach(m => adultItemIds.add(m.id))
+            if (adultItemIds.size !== sizeBefore) saveAdultItemIds()
         }
         return Promise.resolve({metas})
     })
