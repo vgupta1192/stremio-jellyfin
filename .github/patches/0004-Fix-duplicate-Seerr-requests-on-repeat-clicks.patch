@@ -1,0 +1,198 @@
+From c9c95dea7ca8545931e3e06f4d8b4eec9497cd04 Mon Sep 17 00:00:00 2001
+From: Vaibhav <vgupta1192@gmail.com>
+Date: Thu, 20 Aug 2026 21:56:42 +0200
+Subject: [PATCH 04/16] Fix duplicate Seerr requests on repeat clicks
+
+Seerr's own POST /api/v1/request duplicate check is a non-atomic
+SELECT-then-INSERT with no DB constraint - live testing showed two
+taps on the same title 22s apart both created separate requests
+instead of the second hitting a 409.
+
+requestMedia() now guards against duplicates before ever POSTing:
+1. In-memory 30s lock per tmdbId+mediaType (instant, catches repeat
+   taps)
+2. Pre-check against Seerr's GET /movie or /tv endpoint for existing
+   AVAILABLE/PENDING/APPROVED state (catches prior-process-lifetime
+   requests)
+
+Pre-check uses its own 3s timeout on a separate axios instance -
+the first version shared the 15s timeout with everything else and
+was missing the /api/v1 prefix on its path, causing /request to
+occasionally take 20+ seconds and 502 while it hung.
+
+Verified live: rapid repeat requests for the same title resolve in
+~3s then ~0.4s, and Seerr shows exactly one request created.
+---
+ DEPLOYMENT_GUIDE.md |   2 +
+ seerr.js            | 101 +++++++++++++++++++++++++++++++++++++++++++-
+ server.js           |  17 +++-----
+ 3 files changed, 108 insertions(+), 12 deletions(-)
+
+diff --git a/DEPLOYMENT_GUIDE.md b/DEPLOYMENT_GUIDE.md
+index aaede4c..baea8c6 100644
+--- a/DEPLOYMENT_GUIDE.md
++++ b/DEPLOYMENT_GUIDE.md
+@@ -343,6 +343,8 @@ Previously, if a title wasn't yet in the Jellyfin library, `defineStreamHandler`
+ 
+ **New module — `seerr.js`:** mirrors `jellyfin.js`'s client pattern. `requestMedia(tmdbId, mediaType)` calls `POST /api/v1/request` — for TV, requesting all seasons (`seasons: "all"`), since Stremio's per-episode granularity doesn't map cleanly onto a one-click "request this show" action.
+ 
++**Bug hit and fixed during testing — duplicate requests on repeat clicks.** Live testing showed tapping "Request via Seerr" twice on the same title (22 seconds apart) created TWO separate "Requested" entries in Seerr instead of the second one being rejected. Root cause, confirmed by reading Seerr's actual source (`server/entity/MediaRequest.ts`, same in `seerr-team/seerr`/`fallenbagel/jellyseerr`/`sct/overseerr` - the duplicate check is unchanged across the fork lineage): the "does a request already exist" check is a plain `SELECT` immediately followed by an `INSERT`, with no database transaction, no unique constraint on `(tmdbId, mediaType, is4k)`, and no locking - two POSTs close together can both pass the SELECT before the first one's row commits. This addon's original 409-based dedup assumed Seerr's own check was reliable; it isn't. **Fix, in `seerr.js`:** `requestMedia()` now guards against duplicates two ways before ever POSTing: (1) an in-memory `Map` tracking `tmdbId:mediaType` combos requested by this addon process in the last 30 seconds - instant, no network call, catches the exact "impatient repeat tap" scenario that caused the bug; (2) a live pre-check against Seerr's own `GET /api/v1/movie/{tmdbId}` (or `/tv/{tmdbId}`) endpoint, inspecting `mediaInfo.status` (skip if `AVAILABLE`/`PARTIALLY_AVAILABLE`) and `mediaInfo.requests[]` (skip if any entry has status `PENDING`/`APPROVED`) - this catches "already requested in a previous process lifetime" (e.g. after a restart cleared the in-memory guard), which the in-memory check alone can't. **A second bug was hit while building this fix**: the pre-check's first version omitted the `/api/v1` prefix on its request path and shared the same 15-second timeout as every other Seerr call - live testing showed a single `/request` call taking over 20 seconds and returning a 502, because the mis-pathed pre-check call hung for the full 15s before falling through to the real POST. Fixed by correcting the path and giving the pre-check its own dedicated 3-second timeout (`precheckClient`, separate axios instance from `client`) - since the pre-check is a nice-to-have optimization layered on top of the in-memory lock (the actual primary guard), it's fine for it to fail/skip fast rather than block the whole request. Verified live: two rapid requests for the same fresh title (`tt0110357`, The Lion King) resolved in 2.8s and 0.38s respectively (the second hitting the in-memory lock, never reaching Seerr), and Seerr's Requests page confirmed exactly one entry was created.
++
+ **Bug hit and fixed during testing — IMDb-to-TMDb resolution:** the first implementation of `findByImdbId()` searched Seerr's own `/api/v1/search?query=<imdbId>` endpoint, assuming TMDb's search backend would resolve a raw IMDb-id-shaped string directly. Live testing (`tt0068646`, The Godfather — an unambiguous, definitely-indexed title) proved this wrong: `/search` is confirmed (by reading Seerr's own source, `server/routes/search.ts` / `server/api/themoviedb/index.ts`) to be a plain title-text search against TMDb's `/search/multi`, with no external-id matching at all — it silently returned zero relevant results for an ID-shaped query. **Fix:** call TMDb's own `/find/{imdbId}?external_source=imdb_id` endpoint directly instead (the same endpoint Seerr's backend uses internally via `getMediaByImdbId()`/`getByExternalId()`, confirmed in `server/api/themoviedb/index.ts` — it's just never exposed as its own public Seerr route). This uses TMDb's own public "read" API key, which Seerr/Overseerr/Jellyseerr all ship hardcoded in their own open-source repos (`431a8708161bcd1f1fbe7536137e61ed`) — not a secret tied to this deployment, so no separate TMDb account/key registration is needed. Overridable via an optional `TMDB_API_KEY` env var if you'd rather use your own.
+ 
+ **Bug hit and fixed during testing — stale/invalid Seerr API key:** the first API key copied from Seerr's Settings → General page 403'd on `/api/v1/search` (and every other authenticated endpoint) while the unauthenticated `/api/v1/status` and `/api/v1/settings/public` endpoints worked fine — confirmed via direct `curl` (bypassing this addon entirely) and by reading Seerr's own auth middleware (`server/middleware/auth.ts`): it does a strict `req.header('X-API-Key') === settings.main.apiKey` string comparison, and a mismatch means `req.user` never gets set, causing every permission check downstream to 403 regardless of which permission is actually required. Regenerating the key in Seerr's UI and using the fresh value fixed it immediately — the original key had simply gone stale/invalid server-side.
+diff --git a/seerr.js b/seerr.js
+index 914cab3..331b422 100644
+--- a/seerr.js
++++ b/seerr.js
+@@ -49,6 +49,74 @@ export class SeerrApi {
+             params: { api_key: tmdbApiKey },
+             timeout: 15000
+         })
++        // Separate, much shorter timeout specifically for the optional
++        // "already requested?" pre-check (see #alreadyRequestedOrAvailable
++        // below). Live testing showed this endpoint occasionally hangs for
++        // the full 15s (Seerr likely busy processing an active download at
++        // the time), which pushed /request's total response time past 20s
++        // - itself defeating the whole point of responding fast. This is a
++        // nice-to-have optimization, not a correctness requirement (the
++        // in-memory lock is the primary guard against duplicates), so it's
++        // fine for it to fail/skip fast rather than block the request.
++        this.precheckClient = axios.create({
++            baseURL: seerrUrl,
++            headers: { "X-Api-Key": seerrApiKey },
++            timeout: 3000
++        })
++    }
++
++    // In-memory guard against duplicate requests. Seerr's own POST
++    // /api/v1/request duplicate check (server/entity/MediaRequest.ts) is a
++    // non-atomic SELECT-then-INSERT with no DB unique constraint and no
++    // locking - two POSTs close together can both pass the "does a request
++    // already exist" check before the first one's row is committed. Live
++    // testing confirmed this: two taps of "Request via Seerr" on the same
++    // title, 22 seconds apart, both created separate "Requested" entries in
++    // Seerr instead of the second one hitting a 409. This Set tracks
++    // tmdbId+mediaType combos requested recently by THIS addon process, so
++    // a repeat click within REQUEST_LOCK_MS is blocked before ever calling
++    // Seerr, regardless of whether Seerr's own dedup would have caught it.
++    // Not persisted across restarts (an in-memory Set), but that's fine -
++    // it only needs to cover the "user impatiently taps twice" case, not
++    // long-term dedup, since Seerr's GET-based pre-check below (checking
++    // mediaInfo.status/requests) handles the "already requested a while
++    // ago, in a previous process lifetime" case.
++    #recentRequests = new Map()
++    static REQUEST_LOCK_MS = 30 * 1000
++
++    #isRecentlyRequested(tmdbId, mediaType) {
++        const key = `${mediaType}:${tmdbId}`
++        const requestedAt = this.#recentRequests.get(key)
++        if (requestedAt === undefined) return false
++        if (Date.now() - requestedAt > SeerrApi.REQUEST_LOCK_MS) {
++            this.#recentRequests.delete(key)
++            return false
++        }
++        return true
++    }
++
++    #markRecentlyRequested(tmdbId, mediaType) {
++        this.#recentRequests.set(`${mediaType}:${tmdbId}`, Date.now())
++    }
++
++    // Checks Seerr's own record of this title's status/requests BEFORE
++    // submitting a new one - the reliable way to detect "already requested
++    // a while ago", since Seerr's POST-time 409 check is race-prone (see
++    // note above) and this addon process may have restarted since the
++    // original request (clearing the in-memory guard above).
++    async #alreadyRequestedOrAvailable(tmdbId, mediaType) {
++        try {
++            const endpoint = mediaType === "tv" ? `/api/v1/tv/${tmdbId}` : `/api/v1/movie/${tmdbId}`
++            const { data } = await this.precheckClient.get(endpoint)
++            const info = data?.mediaInfo
++            if (!info) return false
++            if (info.status === 5 || info.status === 4) return true // AVAILABLE / PARTIALLY_AVAILABLE
++            const requests = info.requests || []
++            return requests.some(r => r.status === 1 || r.status === 2) // PENDING / APPROVED
++        } catch (err) {
++            console.error("Seerr pre-check failed, proceeding to request anyway:", err?.message || err)
++            return false
++        }
+     }
+ 
+     // Resolves an IMDB id (e.g. "tt1234567") + Stremio type ("movie"/"series")
+@@ -84,13 +152,42 @@ export class SeerrApi {
+     // Submits a request to Seerr. For TV, requests all seasons by default
+     // since Stremio's per-episode granularity doesn't map cleanly onto a
+     // one-click "request this show" action.
++    //
++    // Guards against duplicates two ways before ever POSTing (see the notes
++    // above on why Seerr's own 409 dedup isn't reliable enough alone):
++    //   1. In-memory recent-request lock (this addon process, last 30s)
++    //   2. A live check of Seerr's own mediaInfo.status/requests
++    // Only if both say "not already requested" does this actually POST.
+     async requestMedia(tmdbId, mediaType) {
+         if (!this.enabled) throw new Error("Seerr is not configured")
++
++        if (this.#isRecentlyRequested(tmdbId, mediaType)) {
++            return { alreadyRequested: true }
++        }
++
++        if (await this.#alreadyRequestedOrAvailable(tmdbId, mediaType)) {
++            this.#markRecentlyRequested(tmdbId, mediaType)
++            return { alreadyRequested: true }
++        }
++
+         const body = { mediaType, mediaId: tmdbId }
+         if (mediaType === "tv") body.seasons = "all"
+ 
+-        const { data } = await this.client.post("/api/v1/request", body)
+-        return data
++        try {
++            const { data } = await this.client.post("/api/v1/request", body)
++            this.#markRecentlyRequested(tmdbId, mediaType)
++            return data
++        } catch (err) {
++            // Still mark it, even on Seerr's own 409 - the race this addon
++            // can't fully close is other CLIENTS hitting Seerr directly
++            // (its own web UI, another integration), not this addon's own
++            // repeat clicks, which the guards above now prevent.
++            if (err?.response?.status === 409) {
++                this.#markRecentlyRequested(tmdbId, mediaType)
++                return { alreadyRequested: true }
++            }
++            throw err
++        }
+     }
+ }
+ 
+diff --git a/server.js b/server.js
+index d913d50..eaa863e 100644
+--- a/server.js
++++ b/server.js
+@@ -120,16 +120,13 @@ app.get("/request/:type/:imdbId/:season?/:episode?", async (req, res) => {
+             ))
+         }
+ 
+-        try {
+-            await seerr.requestMedia(match.tmdbId, match.mediaType)
+-        } catch (err) {
+-            // 409 = already requested/available - not a real error, this is
+-            // the expected case on every subsequent open of the same title
+-            // while it's still downloading. Fall through to the placeholder.
+-            if (err?.response?.status !== 409) {
+-                throw err
+-            }
+-        }
++        // requestMedia() itself now guards against duplicates (an in-memory
++        // recent-request lock plus a live Seerr status check - see
++        // seerr.js), so it only throws for genuine failures now, returning
++        // normally (with alreadyRequested: true) for both "just requested"
++        // and "already requested" cases. Either way, fall through to
++        // serving the placeholder below.
++        await seerr.requestMedia(match.tmdbId, match.mediaType)
+     } catch (err) {
+         console.error("Seerr request failed:", err?.response?.data || err?.message || err)
+         res.status(502)
+-- 
+2.47.3
+

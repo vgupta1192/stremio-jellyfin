@@ -1,0 +1,242 @@
+From 456abbe9f194b8ed4974e0715727eeea8e35a155 Mon Sep 17 00:00:00 2001
+From: Vaibhav <vgupta1192@gmail.com>
+Date: Tue, 15 Sep 2026 01:23:04 +0200
+Subject: [PATCH 09/16] Fix season/episode mismatches and missing episode lists
+ for messy libraries
+
+Two separate but related problems, both confirmed live on real content:
+
+1. Some already-downloaded episodes were unreachable because Jellyfin's
+   season/episode numbers didn't line up with what Stremio/Cinemeta asks
+   for:
+   - Blackadder: season 1 correctly split out (6 episodes), but seasons
+     2+ all landed in one "Season Unknown" bucket with continuous
+     absolute numbering (episode 7 = "S2E1"). Asking for season 2
+     directly failed since no season has that IndexNumber.
+   - The Long Ballad: all 46 episode files are named after the release
+     site instead of the show, so Jellyfin's parser extracted no episode
+     number at all (IndexNumber: null on every one) - nothing to match
+     against even though every episode is physically present.
+
+2. Series using the "jf<itemId>" fallback id (see previous commit) had no
+   episode list at all - defineMetaHandler returned no `videos` array, so
+   nothing tells Stremio's UI what episodes exist. A real-imdb-id series
+   gets this for free from Cinemeta merging its own response in, but
+   nothing else recognizes our custom id namespace, so those series
+   rendered as a bare "Play" button like a single movie instead of a
+   browsable season/episode list.
+
+Added getCanonicalEpisodeList() in jellyfin.js as the single source of
+truth both problems share: it assigns every episode of a series one
+(season, episode) pair, keeping real Jellyfin numbers where they're
+unique and trustworthy, and falling back to positional numbering
+(sorted by premiere date, then name) for anything unnumbered or
+colliding - synthetic unnumbered seasons get folded into one season
+past the last real one rather than disappearing. Guards against a messy
+batch release (a "complete series + movies" pack) assigning the same
+number to two different files from two different causes (a shared stray
+index, and an order-dependent collision between a real index and an
+earlier positional fallback) - confirmed live, 32 collisions in a 581-
+episode release resolved to 0.
+
+defineMetaHandler now builds `videos` from this list for every series
+(addon.js), and resolveEpisode (used by both defineStreamHandler and the
+Seerr-request-polling helpers) looks answers up from the exact same
+list, so the episode list Stremio sees and what streams actually
+resolve to can never disagree.
+
+Verified live: Blackadder S2E1 (previously "Request via Seerr" despite
+being downloaded) now plays; The Long Ballad S1E1 same; two jf-fallback
+series ("Our Interpreter", a 500+ episode anime complete pack) now show
+full, individually-playable episode lists instead of a bare Play button.
+---
+ addon.js    | 40 ++++++++++++++++------
+ jellyfin.js | 99 +++++++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 123 insertions(+), 16 deletions(-)
+
+diff --git a/addon.js b/addon.js
+index e36db62..7e0c012 100644
+--- a/addon.js
++++ b/addon.js
+@@ -45,6 +45,33 @@ function itemToMeta(item) {
+     }
+ }
+ 
++// For series, adds the "videos" (episode) list Stremio's UI needs to show
++// a season/episode picker instead of a bare "Play" button. A real IMDb-id
++// series gets this for free from Cinemeta (or another metadata addon that
++// recognizes "tt..." ids) merging its own richer response in - but nothing
++// else on earth recognizes our own "jf<itemId>" fallback ids, so for those
++// this addon is the *only* possible source of an episode list. Without it,
++// confirmed live: Stremio falls back to treating the whole series as one
++// single playable item, exactly like a movie.
++//
++// Built from getCanonicalEpisodeList so the video ids handed to the client
++// use the exact same season/episode numbering resolveEpisode expects back
++// in defineStreamHandler - they're built from the same source, so they
++// can't disagree with each other.
++async function buildDetailedMeta(item) {
++    const meta = itemToMeta(item)
++    if (item.Type !== 'Series') return meta
++    const episodes = await jellyfin.getCanonicalEpisodeList(item.Id)
++    meta.videos = episodes.map(({seasonNum, episodeNum, item: ep}) => ({
++        id: `${meta.id}:${seasonNum}:${episodeNum}`,
++        title: ep.Name || `Episode ${episodeNum}`,
++        season: seasonNum,
++        episode: episodeNum,
++        ...(ep.PremiereDate ? {released: ep.PremiereDate} : {})
++    }))
++    return meta
++}
++
+ // Scopes each catalog id to its own Jellyfin library, so e.g. the Adult
+ // library's content (CollectionType=movies, so it scans/matches properly)
+ // shows up only in its own "Adult" catalog and not also in "Jellyfin
+@@ -74,7 +101,7 @@ builder.defineMetaHandler(async ({type, id}) => {
+     const items = await jellyfin.getItemByAnyId(id)
+     if (items === undefined || items.length === 0)
+         return Promise.resolve({meta: null})
+-    return Promise.resolve({meta: itemToMeta(items[0])})
++    return Promise.resolve({meta: await buildDetailedMeta(items[0])})
+ })
+ 
+ // Builds the fallback "Request via Seerr" stream entry shown when a title
+@@ -153,9 +180,7 @@ export async function resolveJellyfinItem(type, imdbId, season, episode) {
+ 
+     const seriesItem = (await jellyfin.getItemByAnyId(imdbId))[0]
+     if (seriesItem === undefined) return null
+-    const seasonItem = (await jellyfin.getSeasonByParentItemIdAndSeasonNumber(seriesItem.Id, Number(season))).Items.find(it => it.IndexNumber === Number(season))
+-    if (seasonItem === undefined) return null
+-    const episodeItem = (await jellyfin.getEpisodeByItemIdAndSeasonId(seriesItem.Id, seasonItem.Id)).Items.find(it => it.IndexNumber === Number(episode))
++    const episodeItem = await jellyfin.resolveEpisode(seriesItem.Id, Number(season), Number(episode))
+     if (episodeItem === undefined) return null
+     return await jellyfin.getItemById(episodeItem.Id).then(it => it.data)
+ }
+@@ -182,12 +207,7 @@ builder.defineStreamHandler(async ({type, id}) => {
+             const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
+             return Promise.resolve({streams: requestStream ? [requestStream] : []})
+         }
+-        const seasonItem = (await jellyfin.getSeasonByParentItemIdAndSeasonNumber(seriesItem.Id, seasonNum)).Items.find(it => it.IndexNumber === seasonNum)
+-        if (seasonItem === undefined) {
+-            const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
+-            return Promise.resolve({streams: requestStream ? [requestStream] : []})
+-        }
+-        const episodeItem = (await jellyfin.getEpisodeByItemIdAndSeasonId(seriesItem.Id, seasonItem.Id)).Items.find(it => it.IndexNumber === episodeNum)
++        const episodeItem = await jellyfin.resolveEpisode(seriesItem.Id, seasonNum, episodeNum)
+         if (episodeItem === undefined) {
+             const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
+             return Promise.resolve({streams: requestStream ? [requestStream] : []})
+diff --git a/jellyfin.js b/jellyfin.js
+index e794e74..1f94798 100644
+--- a/jellyfin.js
++++ b/jellyfin.js
+@@ -142,13 +142,100 @@ export class JellyfinApi {
+         return this.getItemByImdbId(id)
+     }
+ 
+-     getSeasonByParentItemIdAndSeasonNumber(itemId, seasonNumber) {
+-        return this.authenticatedGet(`${server}/Shows/${itemId}/Seasons?userId=${this.auth.User.Id}`)
+-            .then(item => item.data)
++    // Builds one canonical (season, episode) numbering for every episode of
++    // a series - the single source of truth both defineMetaHandler (the
++    // browsable episode list Stremio's UI needs) and resolveEpisode (given
++    // a season+episode, find the Jellyfin item) use, so they can never
++    // disagree with each other. Handles two real, confirmed-live messy-
++    // library cases beyond a normally-organized show (which just keeps its
++    // real season/episode IndexNumbers unchanged):
++    //
++    // - A season with no IndexNumber ("Season Unknown" - Jellyfin's
++    //   catch-all when it can't group episodes, common for a show scanned
++    //   without season subfolders past season 1) gets folded into one
++    //   synthetic season numbered one past the highest real season number,
++    //   with its episodes numbered positionally (sorted by premiere date,
++    //   then name). This won't always match the show's real season
++    //   breakdown (e.g. seasons 2-4 of a show all lumped into one "season"
++    //   here), but keeps every episode browsable and playable instead of
++    //   invisible - a deliberate, disclosed trade-off, not a guarantee of
++    //   matching official numbering.
++    // - If a season has episodes with no IndexNumber at all (e.g. named
++    //   after the release group/site instead of the real title, so
++    //   Jellyfin's parser had nothing to extract), those also fall back to
++    //   positional numbering within that season.
++    async getCanonicalEpisodeList(seriesId) {
++        const seasons = (await this.authenticatedGet(`${server}/Shows/${seriesId}/Seasons?userId=${this.auth.User.Id}`)).data.Items
++        const episodesFor = async (seasonId) =>
++            (await this.authenticatedGet(`${server}/Shows/${seriesId}/Episodes?seasonId=${seasonId}&userId=${this.auth.User.Id}`)).data.Items
++        const sortEpisodes = (episodes) => [...episodes].sort((a, b) =>
++            (a.PremiereDate || '').localeCompare(b.PremiereDate || '') || (a.Name || '').localeCompare(b.Name || '')
++        )
++
++        const numberedSeasons = seasons
++            .filter(s => s.IndexNumber !== null && s.IndexNumber !== undefined)
++            .sort((a, b) => a.IndexNumber - b.IndexNumber)
++        const unnumberedSeasons = seasons.filter(s => s.IndexNumber === null || s.IndexNumber === undefined)
++
++        const result = []
++
++        for (const season of numberedSeasons) {
++            const sorted = sortEpisodes(await episodesFor(season.Id))
++            // A real IndexNumber is only trustworthy if it's unique within
++            // this season - some messy batch releases (e.g. a "complete
++            // series + movies" torrent packaged as one item) give several
++            // unrelated files the same stray IndexNumber, which would
++            // otherwise collide into the same video id and hide all but one
++            // of them. Anything not uniquely numbered falls back to the
++            // next free positional slot instead, guaranteed not to clash
++            // with any real or already-assigned number in this season.
++            const indexCounts = {}
++            sorted.forEach(ep => {
++                if (ep.IndexNumber !== null && ep.IndexNumber !== undefined) {
++                    indexCounts[ep.IndexNumber] = (indexCounts[ep.IndexNumber] || 0) + 1
++                }
++            })
++            const usedNums = new Set()
++            let nextPositional = 1
++            sorted.forEach(item => {
++                const idx = item.IndexNumber
++                let episodeNum
++                // A real, uniquely-claimed index can still collide with a
++                // number an earlier item already took via the positional
++                // fallback below (order-dependent - the earlier item might
++                // sort first despite having no real index of its own), so
++                // usedNums has to be checked here too, not just in the
++                // fallback branch.
++                if (idx !== null && idx !== undefined && indexCounts[idx] === 1 && !usedNums.has(idx)) {
++                    episodeNum = idx
++                } else {
++                    while (usedNums.has(nextPositional)) nextPositional++
++                    episodeNum = nextPositional
++                }
++                usedNums.add(episodeNum)
++                result.push({seasonNum: season.IndexNumber, episodeNum, item})
++            })
++        }
++
++        if (unnumberedSeasons.length > 0) {
++            const syntheticSeasonNum = numberedSeasons.length > 0
++                ? numberedSeasons[numberedSeasons.length - 1].IndexNumber + 1
++                : 1
++            let extra = []
++            for (const season of unnumberedSeasons) {
++                extra = extra.concat(await episodesFor(season.Id))
++            }
++            sortEpisodes(extra).forEach((item, i) => {
++                result.push({seasonNum: syntheticSeasonNum, episodeNum: i + 1, item})
++            })
++        }
++
++        return result
+     }
+ 
+-     getEpisodeByItemIdAndSeasonId(itemId, seasonId) {
+-        return this.authenticatedGet(`${server}/Shows/${itemId}/Episodes?seasonId=${seasonId}&userId=${this.auth.User.Id}`)
+-            .then(item => item.data)
++    async resolveEpisode(seriesId, seasonNum, episodeNum) {
++        const list = await this.getCanonicalEpisodeList(seriesId)
++        const match = list.find(e => e.seasonNum === seasonNum && e.episodeNum === episodeNum)
++        return match ? match.item : undefined
+     }
+ }
+-- 
+2.47.3
+

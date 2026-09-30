@@ -1,0 +1,141 @@
+From 6f3e90885861b7649210b6b82fbf954f8d768aa3 Mon Sep 17 00:00:00 2001
+From: Vaibhav <vgupta1192@gmail.com>
+Date: Tue, 15 Sep 2026 00:57:27 +0200
+Subject: [PATCH 07/16] Add a dedicated Adult catalog, scoped separately from
+ Movies/Series
+
+Jellyfin's Adult library was previously a bare folder with no
+CollectionType, so it never got scanned/matched against TheMovieDb -
+recreated (delete + re-add, since CollectionType can't be changed
+in-place) as CollectionType=movies with the same LibraryOptions as the
+Movies library, so it now gets proper metadata scanning like Movies/
+Shows always have.
+
+That alone would have made Adult's content bleed into the existing
+"Jellyfin Movies" catalog though: the catalog queries had no per-library
+scoping at all (Items?IncludeItemTypes=Movie with no ParentId searches
+every library on the server at once). Added ParentId scoping to
+searchItems(), a JELLYFIN_{MOVIES,SHOWS,ADULT}_LIBRARY_ID env var per
+library (systemd unit), and a new movie/adult catalog entry in
+manifest.js wired through a catalog-id -> libraryId map in addon.js.
+
+Verified live: three catalogs, no overlap - Jellyfin Movies (20 of 77),
+Adult (20, its own distinct titles), Jellyfin Series (19 of 24,
+unaffected).
+---
+ addon.js    | 16 ++++++++++++++--
+ jellyfin.js | 19 ++++++++++++++++++-
+ manifest.js | 15 +++++++++++++++
+ 3 files changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/addon.js b/addon.js
+index de0d250..f45f730 100644
+--- a/addon.js
++++ b/addon.js
+@@ -2,7 +2,7 @@
+ 
+ import Promise from "es6-promise"
+ import {addonBuilder} from "stremio-addon-sdk"
+-import {JellyfinApi, server} from "./jellyfin.js";
++import {JellyfinApi, server, moviesLibraryId, showsLibraryId, adultLibraryId} from "./jellyfin.js";
+ import {manifest} from "./manifest.js";
+ import {seerr} from "./seerr.js";
+ 
+@@ -40,14 +40,26 @@ function itemToMeta(item) {
+     }
+ }
+ 
++// Scopes each catalog id to its own Jellyfin library, so e.g. the Adult
++// library's content (CollectionType=movies, so it scans/matches properly)
++// shows up only in its own "Adult" catalog and not also in "Jellyfin
++// Movies" - Items?IncludeItemTypes=Movie with no ParentId searches every
++// library on the server at once.
++const CATALOG_LIBRARY_IDS = {
++    'movie:all': moviesLibraryId,
++    'series:all': showsLibraryId,
++    'movie:adult': adultLibraryId,
++}
++
+ builder.defineCatalogHandler(async ({type, id, extra}) => {
+     console.log("request for catalogs: " + type + " " + id)
++    const parentId = CATALOG_LIBRARY_IDS[`${type}:${id}`]
+     return Promise.resolve({
+         // searchItems() now does its own Imdb filtering internally (on the
+         // full, unpaginated list, before slicing to a page - see jellyfin.js)
+         // and returns plain item objects directly, not axios responses, so
+         // no .data unwrapping or re-filtering is needed here any more.
+-        metas: (await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search))
++        metas: (await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId))
+             .map(itemToMeta)
+     })
+ })
+diff --git a/jellyfin.js b/jellyfin.js
+index eb7f0e1..2137fc2 100644
+--- a/jellyfin.js
++++ b/jellyfin.js
+@@ -7,6 +7,18 @@ const password = process.env.JELLYFIN_PASSWORD
+ const device = os.hostname()
+ const itemsLimit = 20
+ 
++// Library ItemIds used to scope catalog queries to a specific Jellyfin
++// library instead of the whole server - without this, e.g. the Adult
++// library's content (once given CollectionType=movies so it scans
++// properly) would also show up in the main "Jellyfin Movies" catalog,
++// since Items?IncludeItemTypes=Movie with no ParentId searches every
++// library at once. Undefined/unset just means "don't scope" (old
++// server-wide behavior), so this is safe to leave blank for setups
++// without a dedicated Adult library.
++export const moviesLibraryId = process.env.JELLYFIN_MOVIES_LIBRARY_ID
++export const showsLibraryId = process.env.JELLYFIN_SHOWS_LIBRARY_ID
++export const adultLibraryId = process.env.JELLYFIN_ADULT_LIBRARY_ID
++
+ export class JellyfinApi {
+ 
+     async authenticate() {
+@@ -86,11 +98,16 @@ export class JellyfinApi {
+     // ids. The whole library is small enough (~100-150 items) that fetching
+     // it in one request and paginating in memory is simpler and cheaper
+     // than the old per-item getItemById() N+1 calls it replaces.
+-    async searchItems(skip, movie, searchTerm = null) {
++    // parentId scopes the search to one library (its Jellyfin ItemId) -
++    // omit it to search the whole server, as before.
++    async searchItems(skip, movie, searchTerm = null, parentId = null) {
+         let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&Recursive=true&Fields=ProviderIds&sortBy=SortName&IncludeItemTypes=${movie ? 'Movie' : 'Series'}`
+         if (searchTerm) {
+             itemsSearch += `&searchTerm=${searchTerm}`
+         }
++        if (parentId) {
++            itemsSearch += `&ParentId=${parentId}`
++        }
+ 
+         return this.authenticatedGet(itemsSearch)
+             .then(it => it.data.Items.filter(item => item.ProviderIds && item.ProviderIds.Imdb))
+diff --git a/manifest.js b/manifest.js
+index 347b2ae..7f839c7 100644
+--- a/manifest.js
++++ b/manifest.js
+@@ -31,6 +31,21 @@ export const manifest = {
+                     "isRequired": false
+                 }
+             ]
++        },
++        {
++            "type": "movie",
++            "id": "adult",
++            "name": "Adult",
++            "extra": [
++                {
++                    "name": "skip",
++                    "isRequired": false
++                },
++                {
++                    "name": "search",
++                    "isRequired": false
++                }
++            ]
+         }
+     ],
+     "resources": [
+-- 
+2.47.3
+

@@ -1,0 +1,100 @@
+From 988e7e0370ed2f49434c85a3622af3afecef7c42 Mon Sep 17 00:00:00 2001
+From: Vaibhav <vgupta1192@gmail.com>
+Date: Thu, 20 Aug 2026 01:03:20 +0200
+Subject: [PATCH 01/16] Fix Jellyfin API integration for modern Jellyfin
+ servers
+
+- Fix JELLYFIN_SERVER base URL to include /jellyfin path prefix
+  (this.auth.User was undefined because auth requests were hitting
+  a 302 redirect instead of the real API)
+- Replace jellyfin-providersid-search-plugin dependency with native
+  Jellyfin /Items API + client-side ProviderIds filtering. The plugin
+  is binary-incompatible with Jellyfin 10.11.x (MissingMethodException
+  on ILibraryManager.GetItemList) and appears unmaintained.
+- Implement defineMetaHandler properly (was hardcoded to return null)
+- Add PUBLIC_JELLYFIN_SERVER env var so poster/stream URLs returned to
+  the Stremio client use the public-facing Jellyfin address instead of
+  the internal localhost address used for the addon's own API calls
+---
+ addon.js    | 17 +++++++++++++----
+ jellyfin.js |  9 +++++++--
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/addon.js b/addon.js
+index dc1135e..6b02915 100644
+--- a/addon.js
++++ b/addon.js
+@@ -5,6 +5,12 @@ import {addonBuilder} from "stremio-addon-sdk"
+ import {JellyfinApi, server} from "./jellyfin.js";
+ import {manifest} from "./manifest.js";
+ 
++// Client-facing URLs (poster images, stream links) must use the publicly
++// reachable Jellyfin address, since they're opened by the Stremio client,
++// not by this addon's own server. Falls back to the internal server value
++// if no public address is configured.
++const publicServer = process.env.PUBLIC_JELLYFIN_SERVER || server
++
+ const jellyfin = new JellyfinApi()
+ await jellyfin.authenticate()
+ 
+@@ -22,7 +28,7 @@ function itemToMeta(item) {
+         id: item.ProviderIds.Imdb,
+         type: item.Type.toLowerCase(),
+         name: item.Name,
+-        poster: `${server}/Items/${item.Id}/Images/Primary`
++        poster: `${publicServer}/Items/${item.Id}/Images/Primary`
+     }
+ }
+ 
+@@ -34,9 +40,12 @@ builder.defineCatalogHandler(async ({type, id, extra}) => {
+     })
+ })
+ 
+-builder.defineMetaHandler(({type, id}) => {
++builder.defineMetaHandler(async ({type, id}) => {
+     console.log("request for meta: " + type + " " + id)
+-    return Promise.resolve({meta: null})
++    const items = await jellyfin.getItemByImdbId(id)
++    if (items === undefined || items.length === 0)
++        return Promise.resolve({meta: null})
++    return Promise.resolve({meta: itemToMeta(items[0])})
+ })
+ 
+ builder.defineStreamHandler(async ({type, id}) => {
+@@ -74,7 +83,7 @@ builder.defineStreamHandler(async ({type, id}) => {
+ 
+     if (!(itemId === undefined)) {
+         const stream = {
+-            url: `${server}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${item.MediaSources[0].Id}`,
++            url: `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${item.MediaSources[0].Id}`,
+             name: 'Jellyfin',
+             description: item.MediaSources[0].MediaStreams[0].DisplayTitle
+         }
+diff --git a/jellyfin.js b/jellyfin.js
+index c000f5b..16c6650 100644
+--- a/jellyfin.js
++++ b/jellyfin.js
+@@ -65,13 +65,18 @@ export class JellyfinApi {
+     }
+ 
+      getItemByImdbId(imdbId) {
+-        return axios.get(`${server}/ProvidersIdSearch?ProviderId=${imdbId}`,
++        // Native Jellyfin /Items API has no direct "find by external provider id" filter,
++        // so we search with Fields=ProviderIds and match client-side. This replaces the
++        // old jellyfin-providersid-search-plugin dependency, which is binary-incompatible
++        // with modern Jellyfin server versions (MissingMethodException on ILibraryManager).
++        return axios.get(`${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&Fields=ProviderIds,MediaSources`,
+             {
+                 headers: {
+                     'Content-Type': 'application/json',
+                     'X-Emby-Authorization': this.authorisationHeader
+                 }
+-            }).then(item => item.data)
++            })
++            .then(res => res.data.Items.filter(it => it.ProviderIds && it.ProviderIds.Imdb === imdbId))
+     }
+ 
+      getSeasonByParentItemIdAndSeasonNumber(itemId, seasonNumber) {
+-- 
+2.47.3
+

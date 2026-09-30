@@ -1,0 +1,75 @@
+name: patch-build
+
+# NuvioTV-style patch build: this branch carries ONLY .github/patches/*.patch
+# on top of vanilla upstream (akarazniewicz/stremio-jellyfin). Every build
+# checks out the LATEST upstream main, applies the patch series in order,
+# syntax-checks the result and publishes it as a public release asset
+# (jellyfin-addon-src.tar.gz) that the VPS downloads, extracts and
+# `docker build`s. When upstream moves, rebase this branch onto it; if a
+# patch stops applying, this build fails loudly instead of shipping stale
+# code.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (patch series)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+          fetch-depth: 0
+
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: akarazniewicz/stremio-jellyfin
+          ref: main
+          path: src
+          fetch-depth: 0
+
+      - name: Record upstream and patch info
+        id: info
+        run: |
+          echo "upstream_sha=$(cd src && git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "patch_count=$(ls fork/.github/patches/*.patch | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: Apply patches on top of upstream
+        run: |
+          cd src
+          shopt -s nullglob
+          for p in ../fork/.github/patches/*.patch; do
+            echo "::group::$(basename "$p")"
+            git apply --3way "$p"
+            echo "::endgroup::"
+          done
+          node --check server.js
+          node --check addon.js
+          node --check jellyfin.js
+          node --check manifest.js
+          node --check seerr.js
+
+      - name: Package patched source
+        run: |
+          tar czf jellyfin-addon-src.tar.gz -C src .
+          sha256sum jellyfin-addon-src.tar.gz
+
+      - name: Release patched source
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "build-${{ github.run_number }}"
+          name: "Patch build #${{ github.run_number }}"
+          body: |
+            Patched source: upstream akarazniewicz/stremio-jellyfin @ ${{ steps.info.outputs.upstream_sha }}
+            plus ${{ steps.info.outputs.patch_count }} patches from `.github/patches/`.
+
+            Deploy: download `jellyfin-addon-src.tar.gz`, extract, `docker build -t <name> .`
+          artifacts: jellyfin-addon-src.tar.gz
+          makeLatest: true

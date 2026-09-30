@@ -1,0 +1,91 @@
+From c1e18026b5c64e3a9821a1806f8c04348eaa9782 Mon Sep 17 00:00:00 2001
+From: Vaibhav <vgupta1192@gmail.com>
+Date: Thu, 20 Aug 2026 07:24:56 +0200
+Subject: [PATCH 02/16] Fix Nuvio catalog visibility: add required catalog name
+ field, relax skip isRequired
+
+- manifest.js: catalogs were missing the spec-required 'name' field, which
+  caused Nuvio's Moshi JSON parser (CatalogDescriptorDto) to throw on manifest
+  fetch, silently dropping the entire addon's catalogs. Stremio's client is
+  more lenient and tolerated the missing field.
+- manifest.js: 'skip' extra was marked isRequired: true, which per the
+  Stremio SDK spec means the catalog is only invoked when a value is
+  supplied - not appropriate for pagination. Set to isRequired: false.
+- jellyfin.js: guard Number(skip) against NaN now that skip can legitimately
+  be omitted by stricter clients.
+- addon.js: filter catalog items missing an IMDb id before mapping to meta,
+  since Jellyfin's hasImdb=true query param isn't reliably enforced
+  server-side.
+---
+ addon.js    | 10 +++++++++-
+ jellyfin.js |  2 +-
+ manifest.js |  6 ++++--
+ 3 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/addon.js b/addon.js
+index 6b02915..c3474c1 100644
+--- a/addon.js
++++ b/addon.js
+@@ -36,7 +36,15 @@ builder.defineCatalogHandler(async ({type, id, extra}) => {
+     console.log("request for catalogs: " + type + " " + id)
+     return Promise.resolve({
+         metas: await Promise.all(await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search))
+-            .then(it => it.map(e => itemToMeta(e.data)))
++            .then(it => it.map(e => e.data))
++            // Jellyfin's hasImdb=true query param is not reliably enforced by the
++            // server (confirmed: items with no ProviderIds still come back), so
++            // filter client-side too. Every Stremio catalog meta object requires
++            // a non-empty `id` per spec; some third-party clients (e.g. Nuvio)
++            // reject the whole catalog response if any entry is missing one,
++            // whereas Stremio's own client silently tolerates it.
++            .then(items => items.filter(item => item.ProviderIds && item.ProviderIds.Imdb))
++            .then(items => items.map(itemToMeta))
+     })
+ })
+ 
+diff --git a/jellyfin.js b/jellyfin.js
+index 16c6650..57a8499 100644
+--- a/jellyfin.js
++++ b/jellyfin.js
+@@ -43,7 +43,7 @@ export class JellyfinApi {
+     }
+ 
+     async searchItems(skip, movie, searchTerm = null) {
+-        let firstItem = Number(skip) + 1
++        let firstItem = (Number(skip) || 0) + 1
+         let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&startIndex=${firstItem}&limit=${itemsLimit}&sortBy=SortName`
+         if (searchTerm) {
+             itemsSearch += `&searchTerm=${searchTerm}`
+diff --git a/manifest.js b/manifest.js
+index 14d9457..347b2ae 100644
+--- a/manifest.js
++++ b/manifest.js
+@@ -5,10 +5,11 @@ export const manifest = {
+         {
+             "type": "movie",
+             "id": "all",
++            "name": "Jellyfin Movies",
+             "extra": [
+                 {
+                     "name": "skip",
+-                    "isRequired": true
++                    "isRequired": false
+                 },
+                 {
+                     "name": "search",
+@@ -19,10 +20,11 @@ export const manifest = {
+         {
+             "type": "series",
+             "id": "all",
++            "name": "Jellyfin Series",
+             "extra": [
+                 {
+                     "name": "skip",
+-                    "isRequired": true
++                    "isRequired": false
+                 },
+                 {
+                     "name": "search",
+-- 
+2.47.3
+

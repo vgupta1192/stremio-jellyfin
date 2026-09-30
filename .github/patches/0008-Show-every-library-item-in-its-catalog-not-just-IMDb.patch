@@ -1,0 +1,180 @@
+From 2558811f57bfad2ecdb0d396bc5122cafd58dcb9 Mon Sep 17 00:00:00 2001
+From: Vaibhav <vgupta1192@gmail.com>
+Date: Tue, 15 Sep 2026 01:05:21 +0200
+Subject: [PATCH 08/16] Show every library item in its catalog, not just
+ IMDb-matched ones
+
+Catalogs were silently dropping any item TheMovieDb couldn't confidently
+match to an IMDb id, since itemToMeta used ProviderIds.Imdb directly as
+the Stremio catalog id and unmatched items have none. Confirmed live
+this was a large fraction of real content, not just junk: Movies 54/54
+matched (now that Adult's items are properly excluded via library
+scoping - see previous commit), but Shows only 19/24 and Adult only
+23/62.
+
+Added a "jf<jellyfin item id>" fallback id (no colon, so it can't
+collide with the "seriesId:season:episode" shape defineStreamHandler
+splits stream request ids on) for anything without a real IMDb id.
+getItemByAnyId() in jellyfin.js dispatches a lookup to either the
+existing IMDb-based search or the new Jellyfin-id-based one depending on
+which shape it sees, and every call site that used to assume every id
+was an IMDb id (meta handler, stream handler, the season/episode
+resolution path, and the Seerr-request-polling helpers) now goes through
+it instead.
+
+Verified live end-to-end, not just catalog visibility: a previously
+invisible movie and a previously invisible series episode (a fresh
+"jf..." id from the catalog response) both resolve through /meta and
+/stream to a real, playable Jellyfin video URL (200, video/x-matroska,
+seekable). All three catalogs now show every single item in their
+library: Movies 54/54, Series 24/24, Adult 62/62.
+---
+ addon.js    | 17 +++++++++++------
+ jellyfin.js | 55 +++++++++++++++++++++++++++++++++++------------------
+ 2 files changed, 48 insertions(+), 24 deletions(-)
+
+diff --git a/addon.js b/addon.js
+index f45f730..e36db62 100644
+--- a/addon.js
++++ b/addon.js
+@@ -31,9 +31,14 @@ function stringToUuid(plainStringUuid) {
+ 
+ let builder = new addonBuilder(manifest)
+ 
++// "jf<itemId>" fallback for items TheMovieDb couldn't confidently match to
++// an IMDb id (common for adult content and obscure/mistitled files) - see
++// getItemByAnyId in jellyfin.js for the corresponding lookup. No colon in
++// either form, so it never collides with the "seriesId:season:episode"
++// shape defineStreamHandler splits on below.
+ function itemToMeta(item) {
+     return {
+-        id: item.ProviderIds.Imdb,
++        id: item.ProviderIds?.Imdb || `jf${item.Id}`,
+         type: item.Type.toLowerCase(),
+         name: item.Name,
+         poster: `${publicServer}/Items/${item.Id}/Images/Primary`
+@@ -66,7 +71,7 @@ builder.defineCatalogHandler(async ({type, id, extra}) => {
+ 
+ builder.defineMetaHandler(async ({type, id}) => {
+     console.log("request for meta: " + type + " " + id)
+-    const items = await jellyfin.getItemByImdbId(id)
++    const items = await jellyfin.getItemByAnyId(id)
+     if (items === undefined || items.length === 0)
+         return Promise.resolve({meta: null})
+     return Promise.resolve({meta: itemToMeta(items[0])})
+@@ -142,11 +147,11 @@ export function buildJellyfinStreamUrl(item) {
+ // clicked on is ready, not merely once the season starts appearing at all.
+ export async function resolveJellyfinItem(type, imdbId, season, episode) {
+     if (season === undefined || episode === undefined) {
+-        const items = await jellyfin.getItemByImdbId(imdbId)
++        const items = await jellyfin.getItemByAnyId(imdbId)
+         return (items && items.length > 0) ? items[0] : null
+     }
+ 
+-    const seriesItem = (await jellyfin.getItemByImdbId(imdbId))[0]
++    const seriesItem = (await jellyfin.getItemByAnyId(imdbId))[0]
+     if (seriesItem === undefined) return null
+     const seasonItem = (await jellyfin.getSeasonByParentItemIdAndSeasonNumber(seriesItem.Id, Number(season))).Items.find(it => it.IndexNumber === Number(season))
+     if (seasonItem === undefined) return null
+@@ -172,7 +177,7 @@ builder.defineStreamHandler(async ({type, id}) => {
+         seasonNum = Number(resolvedId[1])
+         episodeNum = Number(resolvedId[2])
+ 
+-        const seriesItem = (await jellyfin.getItemByImdbId(seriesId))[0]
++        const seriesItem = (await jellyfin.getItemByAnyId(seriesId))[0]
+         if (seriesItem === undefined) {
+             const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
+             return Promise.resolve({streams: requestStream ? [requestStream] : []})
+@@ -192,7 +197,7 @@ builder.defineStreamHandler(async ({type, id}) => {
+         items = [actualEpisodeItem]
+ 
+     } else
+-        items = await jellyfin.getItemByImdbId(id)
++        items = await jellyfin.getItemByAnyId(id)
+ 
+     if (items === undefined || items.length === 0) {
+         const requestStream = buildRequestStream(type, seriesImdbId || id, seasonNum, episodeNum)
+diff --git a/jellyfin.js b/jellyfin.js
+index 2137fc2..e794e74 100644
+--- a/jellyfin.js
++++ b/jellyfin.js
+@@ -83,23 +83,23 @@ export class JellyfinApi {
+         return this.authenticatedGet(`${server}/Users/${this.auth.User.Id}/Items/${itemId}`)
+     }
+ 
+-    // Fetches every Movie/Series in one shot (Fields=ProviderIds so the
+-    // Imdb check below actually has data to look at - the list endpoint
++    // Fetches every Movie/Series in one shot (Fields=ProviderIds so
++    // itemToMeta in addon.js can tell which items have a matched IMDb id
++    // and which need the "jf<itemId>" fallback id - the list endpoint
+     // omits ProviderIds entirely unless explicitly requested, unlike the
+-    // single-item endpoint getItemById used to hit per item), filters to
+-    // only items with a matched IMDb id (hasImdb=true is not reliably
+-    // enforced server-side - confirmed live: identical result counts with
+-    // and without it), THEN paginates. Filtering before paginating matters:
+-    // slicing a fixed-size page of raw Jellyfin items *before* filtering
+-    // (the previous approach) meant a page landing on a run of unmatched/
+-    // junk titles in sort order came back almost empty even though plenty
+-    // of valid items existed later in the list - this is what made the
+-    // catalog look like it only had 3-4 titles when 77+ actually had IMDb
+-    // ids. The whole library is small enough (~100-150 items) that fetching
+-    // it in one request and paginating in memory is simpler and cheaper
+-    // than the old per-item getItemById() N+1 calls it replaces.
+-    // parentId scopes the search to one library (its Jellyfin ItemId) -
+-    // omit it to search the whole server, as before.
++    // single-item endpoint getItemById used to hit per item), then
++    // paginates. No longer filters out items without an IMDb id (it used
++    // to, via hasImdb=true - which isn't reliably enforced server-side
++    // anyway, confirmed live: identical result counts with and without
++    // it): TheMovieDb fails to confidently match a meaningful fraction of
++    // real titles (most of Adult's library, some Shows), and those items
++    // were previously just invisible in every catalog rather than merely
++    // lacking IMDb-based extras. The whole library is small enough
++    // (~100-150 items) that fetching it in one request and paginating in
++    // memory is simpler and cheaper than the old per-item getItemById()
++    // N+1 calls it replaces. parentId scopes the search to one library
++    // (its Jellyfin ItemId) - omit it to search the whole server, as
++    // before.
+     async searchItems(skip, movie, searchTerm = null, parentId = null) {
+         let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&Recursive=true&Fields=ProviderIds&sortBy=SortName&IncludeItemTypes=${movie ? 'Movie' : 'Series'}`
+         if (searchTerm) {
+@@ -110,8 +110,7 @@ export class JellyfinApi {
+         }
+ 
+         return this.authenticatedGet(itemsSearch)
+-            .then(it => it.data.Items.filter(item => item.ProviderIds && item.ProviderIds.Imdb))
+-            .then(items => items.slice(Number(skip) || 0, (Number(skip) || 0) + itemsLimit))
++            .then(it => it.data.Items.slice(Number(skip) || 0, (Number(skip) || 0) + itemsLimit))
+     }
+ 
+      getItemByImdbId(imdbId) {
+@@ -123,6 +122,26 @@ export class JellyfinApi {
+             .then(res => res.data.Items.filter(it => it.ProviderIds && it.ProviderIds.Imdb === imdbId))
+     }
+ 
++    // Fallback lookup for items with no matched external provider id (TheMovieDb
++    // couldn't confidently identify the title - common for adult content and
++    // obscure/mistitled files). Returns the same shape as getItemByImdbId (an
++    // array, so callers can keep doing items[0] either way) so it's a drop-in
++    // alternative, not a special case every caller needs to branch on.
++    getItemByJellyfinId(itemId) {
++        return this.getItemById(itemId).then(res => [res.data]).catch(() => [])
++    }
++
++    // Resolves a catalog item id that may be either a real IMDb id (tt-prefixed)
++    // or our own "jf<itemId>" fallback id (see itemToMeta in addon.js) - use this
++    // instead of getItemByImdbId anywhere a lookup used to assume every id was
++    // an IMDb id.
++    getItemByAnyId(id) {
++        if (id.startsWith('jf')) {
++            return this.getItemByJellyfinId(id.slice(2))
++        }
++        return this.getItemByImdbId(id)
++    }
++
+      getSeasonByParentItemIdAndSeasonNumber(itemId, seasonNumber) {
+         return this.authenticatedGet(`${server}/Shows/${itemId}/Seasons?userId=${this.auth.User.Id}`)
+             .then(item => item.data)
+-- 
+2.47.3
+

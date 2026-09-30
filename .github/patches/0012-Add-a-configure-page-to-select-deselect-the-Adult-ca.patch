@@ -1,0 +1,375 @@
+From b15296c619aacf4433913cd2b89bce5bf02aec54 Mon Sep 17 00:00:00 2001
+From: Vaibhav <vgupta1192@gmail.com>
+Date: Tue, 15 Sep 2026 06:47:02 +0200
+Subject: [PATCH 12/16] Add a configure page to select/deselect the Adult
+ catalog per install
+
+manifest.js: createManifest(showAdult) replaces the static export,
+building two variants with distinct manifest ids
+(community.stremiojellyfin / .noadult) - Stremio has no concept of
+reconfiguring an installed addon's catalog list in place, so this needs
+to be two genuinely separate addons, not one that changes underneath an
+existing install. behaviorHints.configurable added so Stremio shows a
+reconfigure/gear option on either.
+
+addon.js: wrapped the three resource handlers in buildInterface(showAdult)
+and built both variants from it - no logic changes to the handlers
+themselves, since the catalog handler was already driven purely by the
+requested catalog id/type via CATALOG_LIBRARY_IDS, and Stremio only ever
+requests a catalog id that's actually listed in whichever manifest it
+fetched. The "no adult" variant's client simply never asks for
+id: "adult" in the first place.
+
+server.js: mounts both routers - the root path is unchanged from before
+(full catalogs including Adult), so the existing install keeps working
+exactly as it did; /hide-adult is the new variant, with its own
+/hide-adult/manifest.json and /hide-adult/configure. Added a small
+self-contained configure page (checkbox + Install button, no framework/
+build step, matching the existing renderErrorPage's approach) at both
+/configure (defaults checked) and /hide-adult/configure (defaults
+unchecked, matching Stremio's own reconfigure flow which opens
+<manifest-base>/configure for whichever variant is already installed).
+The Install button builds the stremio:// URL client-side from the
+checkbox state at click time.
+
+Verified live: both manifests have the right (and only the right)
+catalogs, both variants' Movies/Series catalogs work correctly, and the
+existing root install's Adult catalog, stream resolution, and episode
+lists are all unaffected.
+---
+ addon.js    | 71 +++++++++++++++++++++++++++-----------------
+ manifest.js | 85 +++++++++++++++++++++++++++--------------------------
+ server.js   | 85 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 170 insertions(+), 71 deletions(-)
+
+diff --git a/addon.js b/addon.js
+index 691a462..f35ea2c 100644
+--- a/addon.js
++++ b/addon.js
+@@ -3,7 +3,7 @@
+ import Promise from "es6-promise"
+ import {addonBuilder} from "stremio-addon-sdk"
+ import {JellyfinApi, server, moviesLibraryId, showsLibraryId, adultLibraryId} from "./jellyfin.js";
+-import {manifest} from "./manifest.js";
++import {createManifest} from "./manifest.js";
+ import {seerr} from "./seerr.js";
+ 
+ // Client-facing URLs (poster images, stream links) must use the publicly
+@@ -29,8 +29,6 @@ function stringToUuid(plainStringUuid) {
+     )
+ }
+ 
+-let builder = new addonBuilder(manifest)
+-
+ // Tracks which items have already had a background image refresh
+ // triggered this process lifetime, so a catalog page rendered repeatedly
+ // (every poll/scroll) doesn't re-request one every single time - one
+@@ -103,27 +101,6 @@ const CATALOG_LIBRARY_IDS = {
+     'movie:adult': adultLibraryId,
+ }
+ 
+-builder.defineCatalogHandler(async ({type, id, extra}) => {
+-    console.log("request for catalogs: " + type + " " + id)
+-    const parentId = CATALOG_LIBRARY_IDS[`${type}:${id}`]
+-    return Promise.resolve({
+-        // searchItems() now does its own Imdb filtering internally (on the
+-        // full, unpaginated list, before slicing to a page - see jellyfin.js)
+-        // and returns plain item objects directly, not axios responses, so
+-        // no .data unwrapping or re-filtering is needed here any more.
+-        metas: (await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId))
+-            .map(itemToMeta)
+-    })
+-})
+-
+-builder.defineMetaHandler(async ({type, id}) => {
+-    console.log("request for meta: " + type + " " + id)
+-    const items = await jellyfin.getItemByAnyId(id)
+-    if (items === undefined || items.length === 0)
+-        return Promise.resolve({meta: null})
+-    return Promise.resolve({meta: await buildDetailedMeta(items[0])})
+-})
+-
+ // Builds the fallback "Request via Seerr" stream entry shown when a title
+ // isn't in the Jellyfin library yet.
+ //
+@@ -209,7 +186,39 @@ export async function resolveJellyfinItem(type, imdbId, season, episode) {
+ 
+ export {jellyfin}
+ 
+-builder.defineStreamHandler(async ({type, id}) => {
++// Builds a complete addon interface for one manifest variant. Both variants
++// (with/without the Adult catalog - see manifest.js) share every handler
++// unchanged: the catalog handler is already driven purely by the requested
++// catalog `id`, and Stremio only ever requests a catalog id that's actually
++// listed in whichever manifest it fetched - so the "no adult" variant's
++// client simply never asks for id: "adult" in the first place, with no
++// extra branching needed here.
++function buildInterface(showAdult) {
++    const builder = new addonBuilder(createManifest(showAdult))
++
++    builder.defineCatalogHandler(async ({type, id, extra}) => {
++        console.log("request for catalogs: " + type + " " + id)
++        const parentId = CATALOG_LIBRARY_IDS[`${type}:${id}`]
++        return Promise.resolve({
++            // searchItems() now does its own Imdb filtering internally (on
++            // the full, unpaginated list, before slicing to a page - see
++            // jellyfin.js) and returns plain item objects directly, not
++            // axios responses, so no .data unwrapping or re-filtering is
++            // needed here any more.
++            metas: (await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId))
++                .map(itemToMeta)
++        })
++    })
++
++    builder.defineMetaHandler(async ({type, id}) => {
++        console.log("request for meta: " + type + " " + id)
++        const items = await jellyfin.getItemByAnyId(id)
++        if (items === undefined || items.length === 0)
++            return Promise.resolve({meta: null})
++        return Promise.resolve({meta: await buildDetailedMeta(items[0])})
++    })
++
++    builder.defineStreamHandler(async ({type, id}) => {
+     console.log("request for streams: " + type + " " + id)
+     let items = []
+     let seriesImdbId = null
+@@ -275,6 +284,14 @@ builder.defineStreamHandler(async ({type, id}) => {
+     console.log(`Cant find stream for: ${id}`)
+     const requestStream = buildRequestStream(type, seriesImdbId || id, seasonNum, episodeNum)
+     return Promise.resolve({streams: requestStream ? [requestStream] : []})
+-})
++    })
++
++    return builder.getInterface()
++}
+ 
+-export const addonInterface = builder.getInterface()
++// Two genuinely separate installable addons (distinct manifest ids - see
++// createManifest) sharing every handler - see server.js for how each is
++// mounted under its own URL prefix, and the /configure page that lets the
++// user pick which one to install.
++export const addonInterfaceFull = buildInterface(true)
++export const addonInterfaceNoAdult = buildInterface(false)
+diff --git a/manifest.js b/manifest.js
+index 7f839c7..c32ee31 100644
+--- a/manifest.js
++++ b/manifest.js
+@@ -1,20 +1,18 @@
+-export const manifest = {
+-    "id": "community.stremiojellyfin",
+-    "version": "1.0.0",
+-    "catalogs": [
++// showAdult controls whether the "Adult" catalog entry is advertised at
++// all - see addon.js, which builds one full addonBuilder interface and one
++// without this catalog, and server.js, which mounts them under different
++// URL prefixes so each is a genuinely separate, installable Stremio addon
++// (distinct manifest id) rather than one addon whose content changes
++// underneath an existing install.
++export function createManifest(showAdult) {
++    const catalogs = [
+         {
+             "type": "movie",
+             "id": "all",
+             "name": "Jellyfin Movies",
+             "extra": [
+-                {
+-                    "name": "skip",
+-                    "isRequired": false
+-                },
+-                {
+-                    "name": "search",
+-                    "isRequired": false
+-                }
++                {"name": "skip", "isRequired": false},
++                {"name": "search", "isRequired": false}
+             ]
+         },
+         {
+@@ -22,41 +20,44 @@ export const manifest = {
+             "id": "all",
+             "name": "Jellyfin Series",
+             "extra": [
+-                {
+-                    "name": "skip",
+-                    "isRequired": false
+-                },
+-                {
+-                    "name": "search",
+-                    "isRequired": false
+-                }
++                {"name": "skip", "isRequired": false},
++                {"name": "search", "isRequired": false}
+             ]
+-        },
+-        {
++        }
++    ]
++    if (showAdult) {
++        catalogs.push({
+             "type": "movie",
+             "id": "adult",
+             "name": "Adult",
+             "extra": [
+-                {
+-                    "name": "skip",
+-                    "isRequired": false
+-                },
+-                {
+-                    "name": "search",
+-                    "isRequired": false
+-                }
++                {"name": "skip", "isRequired": false},
++                {"name": "search", "isRequired": false}
+             ]
++        })
++    }
++    return {
++        // Distinct ids so Stremio treats "with Adult" and "without Adult"
++        // as two genuinely separate addons, not one addon being silently
++        // reconfigured - installing one doesn't touch or replace the other,
++        // and switching the choice on the configure page is a fresh
++        // install of the other one alongside (or instead of) it.
++        "id": showAdult ? "community.stremiojellyfin" : "community.stremiojellyfin.noadult",
++        "version": "1.0.0",
++        "catalogs": catalogs,
++        "resources": [
++            "catalog",
++            "stream",
++            "meta"
++        ],
++        "types": [
++            "movie",
++            "series"
++        ],
++        "name": showAdult ? "Jellyfin" : "Jellyfin (no Adult)",
++        "description": "Stremio Jellyfin integration",
++        "behaviorHints": {
++            "configurable": true
+         }
+-    ],
+-    "resources": [
+-        "catalog",
+-        "stream",
+-        "meta"
+-    ],
+-    "types": [
+-        "movie",
+-        "series"
+-    ],
+-    "name": "Jellyfin",
+-    "description": "Stremio Jellyfin integration"
++    }
+ }
+diff --git a/server.js b/server.js
+index eaa863e..8f8cdbc 100644
+--- a/server.js
++++ b/server.js
+@@ -2,7 +2,7 @@ import path from "path"
+ import { fileURLToPath } from "url"
+ import express from "express"
+ import stremio from "stremio-addon-sdk"
+-import {addonInterface, buildJellyfinStreamUrl, resolveJellyfinItem} from "./addon.js"
++import {addonInterfaceFull, addonInterfaceNoAdult, buildJellyfinStreamUrl, resolveJellyfinItem} from "./addon.js"
+ import {seerr} from "./seerr.js"
+ 
+ // We build our own Express app (instead of using serveHTTP directly) so we
+@@ -12,7 +12,14 @@ import {seerr} from "./seerr.js"
+ const { getRouter } = stremio
+ 
+ const app = express()
+-app.use(getRouter(addonInterface))
++
++// Two genuinely separate installable addons (see manifest.js/addon.js):
++// the root URL is unchanged from before this feature existed (full
++// catalogs including Adult), so any existing install keeps working
++// exactly as it did. /hide-adult is the new variant with that catalog
++// left out of its manifest entirely - not just hidden client-side.
++app.use(getRouter(addonInterfaceFull))
++app.use("/hide-adult", getRouter(addonInterfaceNoAdult))
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url))
+ const PLACEHOLDER_VIDEO_PATH = path.join(__dirname, "assets", "requested-placeholder.mp4")
+@@ -75,6 +82,80 @@ function renderErrorPage(title, message) {
+ </html>`
+ }
+ 
++// Simple, self-contained configure page (no build step/framework in this
++// app, matching renderErrorPage's approach above): a single checkbox for
++// whether to include the Adult catalog, and an Install button that builds
++// the right manifest URL client-side and hands it to Stremio. Reachable at
++// both /configure (fresh install, defaults to the full/Adult-included
++// variant) and /hide-adult/configure (Stremio's own "reconfigure" flow for
++// an already-installed no-adult addon opens <manifest-base>/configure,
++// which for that variant is this same path) - the only difference is which
++// checkbox state is pre-selected, matching whichever variant the user is
++// already on. Since the two variants are genuinely separate addons
++// (distinct manifest ids - see manifest.js), flipping the checkbox and
++// reinstalling adds/replaces the *other* addon rather than converting this
++// one in place - Stremio has no concept of changing an installed addon's id.
++function renderConfigurePage(showAdultChecked) {
++    return `<!DOCTYPE html>
++<html>
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <title>Configure Jellyfin Addon</title>
++  <style>
++    body { font-family: -apple-system, sans-serif; background: #0f1115; color: #eee; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; box-sizing: border-box; }
++    .card { max-width: 420px; width: 100%; text-align: center; }
++    h1 { font-size: 1.4rem; margin-bottom: 24px; }
++    label { display: flex; align-items: center; gap: 10px; justify-content: center; margin-bottom: 24px; font-size: 1.05rem; cursor: pointer; }
++    input[type=checkbox] { width: 20px; height: 20px; cursor: pointer; }
++    button { font-size: 1rem; padding: 12px 28px; border-radius: 8px; border: none; background: #7b5bf5; color: #fff; cursor: pointer; }
++    button:hover { background: #6a4be0; }
++    .manifest-url { margin-top: 20px; font-size: 0.8rem; color: #888; word-break: break-all; }
++    .manifest-url a { color: #9b8cf0; }
++  </style>
++</head>
++<body>
++  <div class="card">
++    <h1>Jellyfin Stremio Addon</h1>
++    <label>
++      <input type="checkbox" id="showAdult" ${showAdultChecked ? "checked" : ""}>
++      Show Adult catalog
++    </label>
++    <button onclick="install()">Install in Stremio</button>
++    <div class="manifest-url">Manifest URL: <a id="manifestLink" href="#"></a></div>
++  </div>
++  <script>
++    function manifestPath() {
++      return document.getElementById('showAdult').checked ? '/manifest.json' : '/hide-adult/manifest.json'
++    }
++    function manifestHttpUrl() {
++      return window.location.origin + manifestPath()
++    }
++    function updateLink() {
++      const el = document.getElementById('manifestLink')
++      el.href = manifestHttpUrl()
++      el.textContent = manifestHttpUrl()
++    }
++    function install() {
++      window.location.href = 'stremio://' + window.location.host + manifestPath()
++    }
++    document.getElementById('showAdult').addEventListener('change', updateLink)
++    updateLink()
++  </script>
++</body>
++</html>`
++}
++
++app.get("/configure", (req, res) => {
++    res.setHeader("content-type", "text/html; charset=utf-8")
++    res.end(renderConfigurePage(true))
++})
++
++app.get("/hide-adult/configure", (req, res) => {
++    res.setHeader("content-type", "text/html; charset=utf-8")
++    res.end(renderConfigurePage(false))
++})
++
+ // This is the URL served as the "Request via Seerr" stream.url itself - NOT
+ // a webpage the user browses to, but an endpoint a video player opens
+ // directly, exactly like it would open any other stream URL. See the
+-- 
+2.47.3
+

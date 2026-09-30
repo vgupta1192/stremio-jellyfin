@@ -1,0 +1,119 @@
+From 5dbb0ceab8b0dd82bed61f0b54129eb77b2de4a8 Mon Sep 17 00:00:00 2001
+From: Vaibhav <vgupta1192@gmail.com>
+Date: Tue, 15 Sep 2026 05:30:20 +0200
+Subject: [PATCH 10/16] Fix a real crash for movies/episodes with incomplete
+ Jellyfin metadata, add visibility logging for every fallback path
+
+Requested audit of all three libraries (Movies, Adult, Series) for the
+same class of issue fixed in the previous two commits. Found one more,
+confirmed live: defineStreamHandler accessed
+item.MediaSources[0].MediaStreams[0].DisplayTitle unconditionally. 6
+real, otherwise-playable files across Movies/Adult (Jellyfin has a
+MediaSource for them but MediaStreams - the per-track technical
+metadata - came back empty, likely an ffprobe failure/incomplete scan)
+crashed the whole stream request instead of just missing a label.
+Confirmed via direct reproduction: {"err":"handler error"} for one of
+them before the fix, real playable stream after. Same guard applied to
+buildJellyfinStreamUrl (the Seerr-request-polling path). All 24 series
+independently swept too (comparing Jellyfin's real per-series episode
+count against what the addon exposes) - all 24 already matched exactly
+thanks to the previous commit's fix, confirming it generalizes rather
+than only covering the 2 examples found manually.
+
+The requested "fix it automatically in future" piece isn't a separate
+feature - it's what the last three commits already do, since
+getCanonicalEpisodeList and this MediaStreams guard both run fresh on
+every request rather than being one-off patches for specific titles.
+Any future messy download hits the same fallback logic automatically.
+What WAS missing is visibility into when that's happening: added
+console.warn logging (stderr) at both fallback points - unnumbered/
+duplicate-numbered episodes landing on positional numbering, and movies/
+episodes missing MediaStreams - each naming the specific item and
+explaining what happened and why, so a real numbering or metadata
+problem is now observable in the logs instead of silently invisible
+even though the addon is working around it.
+---
+ addon.js    | 24 ++++++++++++++++++++----
+ jellyfin.js |  7 +++++++
+ 2 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/addon.js b/addon.js
+index 7e0c012..9bea27a 100644
+--- a/addon.js
++++ b/addon.js
+@@ -161,7 +161,9 @@ function buildRequestStream(type, imdbId, season, episode) {
+ export function buildJellyfinStreamUrl(item) {
+     const itemId = stringToUuid(item.Id)
+     if (itemId === undefined) return null
+-    return `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${item.MediaSources[0].Id}`
++    const mediaSource = item.MediaSources?.[0]
++    if (!mediaSource) return null
++    return `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${mediaSource.Id}`
+ }
+ 
+ // Resolves a movie or specific episode's Jellyfin item, mirroring the same
+@@ -226,12 +228,26 @@ builder.defineStreamHandler(async ({type, id}) => {
+ 
+     const item = items[0]
+     const itemId = stringToUuid(item.Id)
++    // MediaStreams (per-track technical info: resolution/codec/language)
++    // can be empty even when MediaSources itself is populated - e.g. a
++    // file Jellyfin's ffprobe hasn't finished analyzing, or errored on -
++    // confirmed live on real, otherwise-playable files (6 across the
++    // Movies/Adult libraries). That's cosmetic only (the stream label),
++    // not a reason to treat an actually-playable file as unavailable, so
++    // it falls back to the item's own name instead of crashing the whole
++    // request - unlike a missing MediaSources entry entirely, which does
++    // mean there's no real file to play and correctly falls through to
++    // the "not found" / Request-via-Seerr path below.
++    const mediaSource = item.MediaSources?.[0]
+ 
+-    if (!(itemId === undefined)) {
++    if (itemId !== undefined && mediaSource) {
++        if (!mediaSource.MediaStreams?.[0]) {
++            console.warn(`[stream-fallback] ${item.Name} (${item.Id}): MediaSources present but MediaStreams empty - Jellyfin likely hasn't finished (or failed) probing this file's technical details. Still playable, just using the item's name as the stream label instead of resolution/codec info. Fix at the source by re-running metadata refresh on this item, if the label matters here.`)
++        }
+         const stream = {
+-            url: `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${item.MediaSources[0].Id}`,
++            url: `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${mediaSource.Id}`,
+             name: 'Jellyfin',
+-            description: item.MediaSources[0].MediaStreams[0].DisplayTitle
++            description: mediaSource.MediaStreams?.[0]?.DisplayTitle || item.Name
+         }
+         return Promise.resolve({streams: [stream]})
+     }
+diff --git a/jellyfin.js b/jellyfin.js
+index 1f94798..f642ad8 100644
+--- a/jellyfin.js
++++ b/jellyfin.js
+@@ -178,6 +178,7 @@ export class JellyfinApi {
+         const unnumberedSeasons = seasons.filter(s => s.IndexNumber === null || s.IndexNumber === undefined)
+ 
+         const result = []
++        let fallbackNumbered = 0
+ 
+         for (const season of numberedSeasons) {
+             const sorted = sortEpisodes(await episodesFor(season.Id))
+@@ -211,6 +212,7 @@ export class JellyfinApi {
+                 } else {
+                     while (usedNums.has(nextPositional)) nextPositional++
+                     episodeNum = nextPositional
++                    fallbackNumbered++
+                 }
+                 usedNums.add(episodeNum)
+                 result.push({seasonNum: season.IndexNumber, episodeNum, item})
+@@ -228,6 +230,11 @@ export class JellyfinApi {
+             sortEpisodes(extra).forEach((item, i) => {
+                 result.push({seasonNum: syntheticSeasonNum, episodeNum: i + 1, item})
+             })
++            console.warn(`[episode-numbering] ${seriesId}: ${unnumberedSeasons.map(s => s.Name).join(', ')} (${extra.length} episodes with no season number) folded into synthetic season ${syntheticSeasonNum}, numbered positionally - won't necessarily match this show's real season breakdown, but every episode stays browsable and playable. Fix at the source by fixing file/folder naming and re-scanning, if the real season split matters here.`)
++        }
++
++        if (fallbackNumbered > 0) {
++            console.warn(`[episode-numbering] ${seriesId}: ${fallbackNumbered} episode(s) had no usable or unique IndexNumber within their season and were numbered positionally (by premiere date/name) instead - a best-effort guess, not guaranteed to match the real episode order. Fix at the source by fixing file naming and re-scanning, if exact accuracy matters here.`)
+         }
+ 
+         return result
+-- 
+2.47.3
+

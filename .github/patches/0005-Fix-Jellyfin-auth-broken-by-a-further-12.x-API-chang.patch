@@ -1,0 +1,70 @@
+From 54fae162b3cc3463dc573e9856a1b17080cb76bc Mon Sep 17 00:00:00 2001
+From: Vaibhav <vgupta1192@gmail.com>
+Date: Tue, 15 Sep 2026 00:33:18 +0200
+Subject: [PATCH 05/16] Fix Jellyfin auth broken by a further 12.x API change
+ (missing App field)
+
+Jellyfin's AuthenticateByName endpoint now throws ArgumentNullException
+on 'request.App' when the MediaBrowser Authorization header doesn't
+include an App= field - confirmed via the server's own log
+(System.ArgumentNullException: Value cannot be null (Parameter
+'request.App') in AuthenticateNewSessionInternal). The addon's existing
+Client=/Device=/DeviceId=/Version= header (already updated once before
+for the 10.11->12+ Authorization-header migration) didn't set this, so
+every fresh authentication attempt failed and the process would exit()
+- the running instance had just been coasting on an old cached token
+from before whatever changed, would have gone down for good on its next
+restart or token expiry. Confirmed live: same call succeeds once App=
+is added to the header, both for login and the reusable authenticated
+header built from the response.
+---
+ jellyfin.js | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/jellyfin.js b/jellyfin.js
+index d50e016..992a32d 100644
+--- a/jellyfin.js
++++ b/jellyfin.js
+@@ -15,7 +15,11 @@ export class JellyfinApi {
+             {Username: user, Pw: password}, {
+                 headers: {
+                     'Content-Type': 'application/json',
+-                    'X-Emby-Authorization': `MediaBrowser Client="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0""`
++                    // Jellyfin 12+ (upgraded from 10.11) dropped support for the legacy
++                    // X-Emby-Authorization/X-Emby-Token headers entirely; it now requires
++                    // the standard Authorization header, still using the MediaBrowser
++                    // scheme, for both login and all authenticated requests.
++                    'Authorization': `MediaBrowser Client="Jellyfin Stremio Addon", App="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0"`
+                 }
+             }).then(it => it.data)
+             .catch(err => {
+@@ -29,7 +33,7 @@ export class JellyfinApi {
+                 process.exit()
+             })
+         console.log(`Successfully connected to Jellyfin server: ${server}. Happy streaming.`)
+-        this.authorisationHeader = `MediaBrowser Client="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0", Token="${this.auth.AccessToken}"`
++        this.authorisationHeader = `MediaBrowser Client="Jellyfin Stremio Addon", App="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0", Token="${this.auth.AccessToken}"`
+     }
+ 
+     // Jellyfin session tokens can be invalidated/rotated server-side at any
+@@ -45,7 +49,7 @@ export class JellyfinApi {
+             return await axios.get(url, {
+                 headers: {
+                     'Content-Type': 'application/json',
+-                    'X-Emby-Authorization': this.authorisationHeader
++                    'Authorization': this.authorisationHeader
+                 }
+             })
+         } catch (err) {
+@@ -57,7 +61,7 @@ export class JellyfinApi {
+             return axios.get(url, {
+                 headers: {
+                     'Content-Type': 'application/json',
+-                    'X-Emby-Authorization': this.authorisationHeader
++                    'Authorization': this.authorisationHeader
+                 }
+             })
+         }
+-- 
+2.47.3
+
