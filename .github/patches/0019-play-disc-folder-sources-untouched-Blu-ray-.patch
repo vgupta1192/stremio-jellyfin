@@ -1,0 +1,175 @@
+From d926ba986031c7f5b96145625f754c5a110b1022 Mon Sep 17 00:00:00 2001
+From: vgupta1192 <vgupta1192@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 15:53:34 +0530
+Subject: [PATCH] Play disc/folder sources (untouched Blu-ray BD50 etc) via an
+ HLS proxy route
+
+A Blu-ray folder source has no single file to serve, so Jellyfin's static
+stream.mkv?static=true remux returns 500 (confirmed live: RAID 2018 BD50).
+Those sources need a transcoded HLS master playlist - and Jellyfin 12
+rejects api_key-in-query auth on the HLS endpoints while players send no
+Authorization header, so a /hls/:itemId/* route in server.js fetches the
+playlists/segments server-side with the addon's session, rewrites relative
+playlist URLs back through the proxy, and pipes segments with Range
+support. Single-file media keeps direct-streaming exactly as before.
+---
+ addon.js  | 37 ++++++++++++++++++++++----
+ server.js | 77 ++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 108 insertions(+), 6 deletions(-)
+
+diff --git a/addon.js b/addon.js
+index afd41f1..797d32a 100644
+--- a/addon.js
++++ b/addon.js
+@@ -223,6 +223,27 @@ export function buildJellyfinStreamUrl(item) {
+     return `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${mediaSource.Id}`
+ }
+ 
++// Disc/folder media sources (an untouched Blu-ray "1xBD50" folder, a DVD
++// Video_TS tree, ...) have no single file to serve, so Jellyfin's static
++// /stream.mkv?static=true remux answers 500 for them (confirmed live: RAID
++// 2018 BD50). Those need a TRANSCODED HLS playlist instead - and Jellyfin 12
++// rejects api_key-in-query auth on the HLS endpoints while players send no
++// Authorization header, so the playlist and segments are proxied through
++// this addon's own /hls route, which authenticates server-side - see
++// server.js.
++const VIDEO_FILE_RE = /\.(mkv|mp4|avi|wmv|m4v|mpg|mpeg|ts|mov|flv|iso)$/i
++export function isDiscFolderSource(mediaSource) {
++    if (!mediaSource) return false
++    if (/(bd50|bdmv|bluray|dvd|video_ts)/i.test(mediaSource.Container || "")) return true
++    return mediaSource.Protocol === "File" && mediaSource.Path && !VIDEO_FILE_RE.test(mediaSource.Path)
++}
++
++// The addon-side HLS entry URL for a disc/folder source, served by
++// server.js's /hls proxy (auth + relative-URL rewriting live there).
++export function buildProxyHlsUrl(item, mediaSource) {
++    return `${publicSelfUrl}/hls/${item.Id}/master.m3u8?msid=${mediaSource.Id}`
++}
++
+ // Resolves a movie or specific episode's Jellyfin item, mirroring the same
+ // lookup logic defineStreamHandler uses below. Exposed so server.js's
+ // polling /request-status endpoint can check availability using the exact
+@@ -351,11 +372,17 @@ function buildInterface(config) {
+         if (!mediaSource.MediaStreams?.[0]) {
+             console.warn(`[stream-fallback] ${item.Name} (${item.Id}): MediaSources present but MediaStreams empty - Jellyfin likely hasn't finished (or failed) probing this file's technical details. Still playable, just using the item's name as the stream label instead of resolution/codec info. Fix at the source by re-running metadata refresh on this item, if the label matters here.`)
+         }
+-        const stream = {
+-            url: `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${mediaSource.Id}`,
+-            name: 'Jellyfin',
+-            description: mediaSource.MediaStreams?.[0]?.DisplayTitle || item.Name
+-        }
++        const stream = isDiscFolderSource(mediaSource)
++            ? {
++                url: buildProxyHlsUrl(item, mediaSource),
++                name: 'Jellyfin',
++                description: `${mediaSource.MediaStreams?.[0]?.DisplayTitle || item.Name} (transcoded)`
++            }
++            : {
++                url: `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${mediaSource.Id}`,
++                name: 'Jellyfin',
++                description: mediaSource.MediaStreams?.[0]?.DisplayTitle || item.Name
++            }
+         return Promise.resolve({streams: [stream]})
+     }
+ 
+diff --git a/server.js b/server.js
+index 9f6a4c0..7994a82 100644
+--- a/server.js
++++ b/server.js
+@@ -1,10 +1,12 @@
+ import path from "path"
+ import { fileURLToPath } from "url"
+ import express from "express"
++import axios from "axios"
+ import stremio from "stremio-addon-sdk"
+-import {interfacesBySlug, buildJellyfinStreamUrl, resolveJellyfinItem, isRequestableItemId} from "./addon.js"
++import {interfacesBySlug, buildJellyfinStreamUrl, resolveJellyfinItem, isRequestableItemId, jellyfin} from "./addon.js"
+ import {ALL_CONFIGS, configToSlug} from "./manifest.js"
+ import {seerr} from "./seerr.js"
++import {server as jellyfinServer} from "./jellyfin.js"
+ 
+ // We build our own Express app (instead of using serveHTTP directly) so we
+ // can add the /request route below, which serveHTTP has no hook for. This
+@@ -271,6 +273,79 @@ app.get("/request/:type/:imdbId/:season?/:episode?", async (req, res) => {
+     })
+ })
+ 
++// Transcode-HLS proxy for disc/folder media sources (untouched Blu-ray BD50
++// folders etc). Jellyfin 12 requires the Authorization header on the HLS
++// endpoints - api_key-in-query is rejected there (401, confirmed live) - and
++// Stremio/Nuvio players send no headers, so this addon fetches the
++// playlist/segments server-side with its own session and pipes them to the
++// player:
++//   - master/variant playlists: every non-comment line is a RELATIVE
++//     Jellyfin URL ("live.m3u8?MediaSourceId=..."); rewrite it to this same
++//     /hls route so the player's next hop comes back through the proxy.
++//   - media segments: piped through with Range support.
++// Normal single-file media never uses this route - it direct-streams from
++// Jellyfin with api_key in the query, as before.
++function proxyStringToUuid(plainStringUuid) {
++    return plainStringUuid.replace(
++        /(.{8})(.{4})(.{4})(.{4})(.{12})/g,
++        "$1-$2-$3-$4-$5"
++    )
++}
++
++app.get("/hls/:itemId/*", async (req, res) => {
++    const itemId = proxyStringToUuid(req.params.itemId)
++    const tail = req.params[0] || "master.m3u8"
++    const query = { ...req.query }
++    delete query.msid
++    if (tail === "master.m3u8") {
++        if (!query.MediaSourceId && req.query.msid) query.MediaSourceId = req.query.msid
++        Object.assign(query, {
++            VideoCodec: "h264,h265,hevc",
++            AudioCodec: "aac,mp3,ac3,eac3",
++            SegmentContainer: "ts",
++            TranscodeReasons: "ContainerNotSupported",
++        })
++    }
++    const target = `${jellyfinServer}/videos/${itemId}/${tail}?${new URLSearchParams(query).toString()}`
++    try {
++        const headers = { Authorization: jellyfin.authorisationHeader }
++        if (req.headers.range) headers.Range = req.headers.range
++        const upstream = await axios.get(target, {
++            headers,
++            responseType: "stream",
++            timeout: 60000,
++            decompress: false,
++        })
++        const ct = String(upstream.headers["content-type"] || "")
++        if (tail.endsWith(".m3u8") || ct.includes("mpegurl")) {
++            let body = ""
++            for await (const chunk of upstream.data) body += chunk.toString()
++            const base = `/hls/${req.params.itemId}/`
++            const rewritten = body
++                .split("\n")
++                .map((line) => {
++                    const t = line.trim()
++                    if (!t || t.startsWith("#")) return line
++                    if (/^https?:\/\//i.test(t)) return line
++                    return base + t.replace(/^\/+/, "")
++                })
++                .join("\n")
++            res.status(upstream.status)
++            res.set("content-type", "application/vnd.apple.mpegurl")
++            return res.send(rewritten)
++        }
++        res.status(upstream.status)
++        for (const h of ["content-type", "content-length", "content-range", "accept-ranges", "etag", "last-modified"]) {
++            if (upstream.headers[h] !== undefined) res.set(h, upstream.headers[h])
++        }
++        upstream.data.pipe(res)
++    } catch (err) {
++        console.error("HLS proxy error for", tail, err?.response?.status || err?.message || err)
++        if (!res.headersSent) res.status(err?.response?.status || 502)
++        res.end()
++    }
++})
++
+ const port = process.env.SERVER_PORT || 60421
+ app.listen(port, () => {
+     console.log(`HTTP addon accessible at: http://127.0.0.1:${port}/manifest.json`)
+-- 
+2.47.3
+
