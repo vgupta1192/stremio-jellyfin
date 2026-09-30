@@ -1,0 +1,2138 @@
+From 5b721526f52fc3670a3597d1aab52eab55fe8a20 Mon Sep 17 00:00:00 2001
+From: vgupta1192 <vgupta1192@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 15:31:57 +0530
+Subject: [PATCH] Dockerfile: copy assets/ (Seerr placeholder video) into the
+ image
+
+The /request endpoint (the 'Request via Seerr' stream URL) serves
+assets/requested-placeholder.mp4 to the player. The Docker build only copied
+package*.json and *.js, so the file was missing from the image and the
+endpoint would submit the Seerr request but then fail to respond with the
+placeholder. Never noticed before because the addon only ever ran natively
+(systemd), not from this Dockerfile.
+
+Also add a .dockerignore so the build context stays minimal.
+---
+ .dockerignore                    |   3 +
+ .gitignore                       |   1 +
+ DEPLOYMENT_GUIDE.md              | 457 +++++++++++++++++++++++++++++++
+ Dockerfile                       |   1 +
+ addon.js                         | 366 ++++++++++++++++++++++---
+ assets/requested-placeholder.mp4 | Bin 0 -> 30724 bytes
+ jellyfin.js                      | 258 ++++++++++++++---
+ manifest.js                      | 120 +++++---
+ package-lock.json                |   1 +
+ package.json                     |   1 +
+ seerr.js                         | 194 +++++++++++++
+ server.js                        | 276 ++++++++++++++++++-
+ 12 files changed, 1559 insertions(+), 119 deletions(-)
+ create mode 100644 .dockerignore
+ create mode 100644 DEPLOYMENT_GUIDE.md
+ create mode 100644 assets/requested-placeholder.mp4
+ create mode 100644 seerr.js
+
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..b0e6026
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,3 @@
++.git
++DEPLOYMENT_GUIDE.md
++data
+diff --git a/.gitignore b/.gitignore
+index 3c3629e..ad250eb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,2 @@
+ node_modules
++data/
+diff --git a/DEPLOYMENT_GUIDE.md b/DEPLOYMENT_GUIDE.md
+new file mode 100644
+index 0000000..baea8c6
+--- /dev/null
++++ b/DEPLOYMENT_GUIDE.md
+@@ -0,0 +1,457 @@
++# Deploying stremio-jellyfin on an Ultra.cc Seedbox
++
++This guide documents the full deployment of [vgupta1192/stremio-jellyfin](https://github.com/vgupta1192/stremio-jellyfin) (a fork of [akarazniewicz/stremio-jellyfin](https://github.com/akarazniewicz/stremio-jellyfin)) on a non-root Ultra.cc seedbox account, including every real bug hit along the way and how each was fixed. It also documents a full investigation into using Tailscale and Cloudflare Tunnel to expose the addon, and why the final answer was neither of those.
++
++Final result: the addon runs as a systemd user service, talks to a Jellyfin server also running on the same seedbox, and is reachable at a permanent, free public URL with no path prefix:
++
++```
++http://vgupta1192.duckdns.org:5010/manifest.json
++```
++
++## 1. Requirements
++
++Before deploying, these were confirmed:
++
++- **A running Jellyfin server.** This addon is a *bridge*, not a standalone streaming source — it requires `JELLYFIN_SERVER`, `JELLYFIN_USER`, `JELLYFIN_PASSWORD` pointing at an existing Jellyfin instance. If you don't have Jellyfin running somewhere already, this addon does nothing on its own.
++- **Node.js.** The repo's `package.json` specifies `"node": "^20.x"`, and only two real dependencies: `axios` and `stremio-addon-sdk`. No native modules, no build step.
++- Originally, the README also lists a companion Jellyfin plugin (**jellyfin-providersid-search-plugin**) as required. In practice this plugin turned out to be **abandoned and binary-incompatible with modern Jellyfin** (see Section 4) — the final deployment does not use it at all.
++
++## 2. Deployment method: native Node + systemd, not Docker
++
++The repo ships a `Dockerfile` and documents `docker pull ghcr.io/akarazniewicz/stremio-jellyfin` as the install method. This seedbox runs every other addon (Sootio, Comet, StremThru, MediaFusion, etc.) natively via systemd user services instead of Docker, for consistency with the existing watchdog/auto-update/log-rotation tooling. Given this addon has zero native dependencies, native deployment was the obvious choice — no Docker daemon overhead, and it plugs directly into existing monitoring.
++
++```bash
++mkdir -p ~/apps
++cd ~/apps
++git clone https://github.com/vgupta1192/stremio-jellyfin.git
++cd stremio-jellyfin
++
++export PATH=/home/<user>/.nvm/versions/node/v24.19.0/bin:$PATH
++npm install
++```
++
++**Why Node v24, not v20 (the repo's stated target):** see Section 3.
++
++## 3. Bug #1 — WASM out-of-memory crash on Node v20
++
++On first boot under Node v20, the addon crashed immediately:
++
++```
++RangeError: WebAssembly.instantiate(): Out of memory: Cannot allocate Wasm memory for new instance
++    at lazyllhttp (node:internal/deps/undici/undici:5943:32)
++```
++
++This is **not a bug in the addon's code** — it's `undici` (Node's built-in HTTP client, used internally by `axios`/`fetch`) lazily loading a WASM-compiled HTTP parser on first network request. On this seedbox, the account has a hard, non-negotiable `ulimit -v` (virtual memory) ceiling of ~9.5GB, set by the host and unchangeable by a non-root user. Node v20's V8 engine reserves enough virtual address space for WASM guard pages that it exceeds this ceiling even for a trivial allocation. Node v24's V8 does not have this problem — it reserves less virtual address space for WASM instances, a genuine upstream improvement.
++
++This exact issue and fix were already established earlier in this project for a different addon (Sootio), which hit the identical crash.
++
++**Fix:** run the service under Node v24 instead of v20. No code changes needed — this addon has no native modules, so there's no ABI-compatibility concern (unlike Sootio's `better-sqlite3`, which required a specific rebuild).
++
++```ini
++# ~/.config/systemd/user/stremio-jellyfin.service
++ExecStart=/home/<user>/.nvm/versions/node/v24.19.0/bin/node server.js
++```
++
++## 4. Bug #2 — `this.auth.User` is undefined after login
++
++With the service running, catalog browsing initially worked, but every request logged:
++
++```
++TypeError: Cannot read properties of undefined (reading 'Id')
++    at JellyfinApi.searchItems (jellyfin.js:47:68)
++```
++
++Root cause: the Jellyfin server on this box has its **Base URL** set to `/jellyfin` (Dashboard → Networking → Base URL), so the real API root is `http://127.0.0.1:11102/jellyfin`, not `http://127.0.0.1:11102`. Hitting the bare root returns a `302 Found` redirect (`Location: ../jellyfin/web/`) instead of JSON, so `axios.post(...).then(it => it.data)` resolved to `undefined`, and every downstream `.User.Id` access threw.
++
++**Fix:** point `JELLYFIN_SERVER` at the correct base path:
++
++```ini
++Environment=JELLYFIN_SERVER=http://127.0.0.1:11102/jellyfin
++```
++
++No code change required for this one — confirmed via direct testing that the addon's own URL-building logic already handles the base path correctly once given the right root.
++
++If your Jellyfin doesn't use a custom base URL, `JELLYFIN_SERVER` would just be `http://<host>:<port>` with no suffix.
++
++## 5. Bug #3 — the companion plugin is dead on modern Jellyfin
++
++Once auth was fixed, catalog browsing worked end-to-end, but clicking into any title to actually play it failed:
++
++```
++AxiosError: Request failed with status code 404
++    url: 'http://127.0.0.1:11102/jellyfin/ProvidersIdSearch?ProviderId=tt0322259'
++```
++
++This endpoint is added by the companion plugin `jellyfin-providersid-search-plugin`, which the addon's README says is required. It wasn't installed yet, so installing it via **Dashboard → Plugins → Repositories** (add repo `https://raw.githubusercontent.com/akarazniewicz/jellyfin-providersid-search-plugin/main/manifest.json`) → **Catalog** → install "Providers ID Items Search API" seemed like the fix.
++
++After installing, the endpoint stopped 404ing but started 500ing instead. Checking Jellyfin's own server log (`~/.apps/jellyfin/log/log_<date>.log`) revealed the real cause:
++
++```
++System.MissingMethodException: Method not found: 'System.Collections.Generic.List`1<MediaBrowser.Controller.Entities.BaseItem>
++MediaBrowser.Controller.Library.ILibraryManager.GetItemList(MediaBrowser.Controller.Entities.InternalItemsQuery)'.
++   at Jellyfin.Plugin.ProvidersIdSearch.Controller.ProvidersIdSearchController.FindItemsByProvidersId(String ProviderId)
++```
++
++The plugin's compiled DLL calls a Jellyfin server method signature that no longer exists — it was built against an older Jellyfin API (likely 10.8.x/10.9.x era) and this seedbox runs **Jellyfin 10.11.11**, a much newer release. The plugin is a small, apparently unmaintained project; downgrading the entire Jellyfin server just to keep one addon plugin working would risk the whole media server and any other integrations (e.g. Jellyseerr) for no good reason.
++
++**Fix: remove the plugin dependency entirely**, replacing it with Jellyfin's own built-in `/Items` search API. Jellyfin's core API has no direct "find item by external provider ID" filter parameter (confirmed by pulling the live OpenAPI spec from `/jellyfin/api-docs/openapi.json` and checking every parameter on `/Items` — nothing matches), but it does support requesting `Fields=ProviderIds` on a recursive item search, letting the client filter by the exact IMDb ID itself:
++
++```js
++// jellyfin.js — getItemByImdbId()
++return axios.get(`${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&Fields=ProviderIds,MediaSources`,
++    { headers: { 'X-Emby-Authorization': this.authorisationHeader } })
++    .then(res => res.data.Items.filter(it => it.ProviderIds && it.ProviderIds.Imdb === imdbId))
++```
++
++`hasImdb=true` narrows the server-side result set to only IMDb-tagged items before the client-side filter runs, keeping the payload reasonable even for large libraries (tested against a 1190-item library without issue).
++
++This means **the plugin is no longer required at all** for this fork. You can skip Section-5's plugin install steps entirely on a fresh deploy — they're documented here only because they were part of the diagnostic path, and because the original upstream README still says the plugin is required (it's a fair assumption until you've hit this exact version-incompatibility, since it works fine on older Jellyfin installs).
++
++## 6. Bug #4 — meta handler always returned null
++
++Separately from the plugin issue, `addon.js`'s `defineMetaHandler` was hardcoded:
++
++```js
++builder.defineMetaHandler(({type, id}) => {
++    return Promise.resolve({meta: null})
++})
++```
++
++This meant Stremio's "more info" view for any title would always show nothing, regardless of the plugin/API issue. Fixed to actually look up and return the item's metadata using the same `getItemByImdbId` now backed by the native API.
++
++## 7. Bug #5 — stream/poster URLs used the internal loopback address
++
++Even after the above fixes, the URLs returned to the *Stremio client* (poster images, the actual video stream link) were built from the same `JELLYFIN_SERVER` value used for the addon's own server-to-server API calls: `http://127.0.0.1:11102/jellyfin`. That's correct for the addon's own network calls (fast, local), but useless for a real Stremio client on a phone/PC/TV, which cannot reach the seedbox's own loopback address.
++
++**Fix:** added a second env var, `PUBLIC_JELLYFIN_SERVER`, used only for client-facing URLs:
++
++```ini
++Environment=JELLYFIN_SERVER=http://127.0.0.1:11102/jellyfin
++Environment=PUBLIC_JELLYFIN_SERVER=https://vgupta1192.peak.usbx.me/jellyfin
++```
++
++```js
++// addon.js
++const publicServer = process.env.PUBLIC_JELLYFIN_SERVER || server
++// used in itemToMeta()'s poster URL and the stream handler's stream URL
++```
++
++If you don't set `PUBLIC_JELLYFIN_SERVER`, it falls back to `JELLYFIN_SERVER` (matching the original behavior) so this change is backward compatible.
++
++## 8. All fixes pushed upstream (to the user's fork)
++
++Since [akarazniewicz/stremio-jellyfin](https://github.com/akarazniewicz/stremio-jellyfin) (the original upstream) appears unmaintained, and `vgupta1192/stremio-jellyfin` is a personal fork with no active upstream sync expected, all of the above fixes were committed and pushed directly:
++
++```bash
++cd ~/apps/stremio-jellyfin
++git add jellyfin.js addon.js
++git commit -m "Fix Jellyfin API integration for modern Jellyfin servers"
++git push origin main
++```
++
++Commit: `988e7e0`. A fresh clone of this fork will now deploy correctly without hitting any of bugs #2–#5.
++
++## 8a. Bug #6 — catalogs worked in Stremio but were invisible in Nuvio
++
++After the deployment above, the addon worked correctly in the Stremio app (both catalogs browsable, streams playable), but a separate client app, **Nuvio** (a different Stremio-protocol client, `NuvioMedia/NuvioTV`/`NuvioMobile`/`NuvioDesktop`), showed neither of the two Jellyfin catalogs at all — even though Nuvio could still resolve and play Jellyfin streams reached through *other* addons' catalogs. This ruled out anything wrong with Jellyfin itself or the stream-resolution code path, and pointed specifically at how Nuvio parses this addon's `manifest.json`.
++
++**First (partial) fix attempt:** confirmed via direct curl testing that ~30% of catalog entries had no `id` field, because Jellyfin's `hasImdb=true` query parameter is not reliably enforced server-side (items with empty `ProviderIds` still came back). Added a client-side filter in `addon.js` to drop any item missing an IMDb id before mapping it to a Stremio meta object. This was a real, spec-required fix (every catalog meta object must have a non-empty `id`), but deploying and retesting showed it did **not** resolve the Nuvio-visibility issue on its own.
++
++**Root cause, found by reading Nuvio's own client source** (`NuvioMedia/NuvioTV`, an open-source Kotlin/Compose Android TV app): Nuvio parses `manifest.json` with a strict Moshi JSON adapter into `AddonManifestDto` → `CatalogDescriptorDto`:
++
++```kotlin
++// NuvioTV: app/src/main/java/com/nuvio/tv/data/remote/dto/AddonManifestDto.kt
++data class CatalogDescriptorDto(
++    @Json(name = "type") val type: String,
++    @Json(name = "id") val id: String,
++    @Json(name = "name") val name: String,   // <-- non-nullable, no default
++    ...
++)
++```
++
++`name` is a required, non-nullable field with no default value. This addon's `manifest.js` catalog objects had `type` and `id` but **no `name` field at all** — technically also a Stremio SDK spec violation (`name` is documented as required in the manifest format), but one Stremio's own client tolerates silently. Moshi does not: a missing required field throws a `JsonDataException`, which fails the **entire manifest fetch** (`Response<AddonManifestDto>` via Retrofit) — not just the malformed catalog entry. That's why *both* catalogs vanished together in Nuvio while direct stream requests (`/stream/{type}/{id}`, which don't go through this DTO) kept working fine.
++
++A second, independent manifest issue was found and fixed at the same time: `extra: [{ name: "skip", isRequired: true }]`. Per the Stremio SDK docs, `isRequired: true` on an extra means the catalog is *only* invoked when that value is supplied — intended for search-only catalogs, not pagination. Cross-checked directly against Nuvio's actual filtering logic (`SearchViewModel.kt`, `HomeViewModelCatalogUtils.kt`): any `isRequired` extra other than `search` disqualifies a catalog from being treated as browsable, so this was also a real (if secondary) bug — though the missing `name` field was the one actually causing the total parse failure.
++
++**Fix**, in `manifest.js`:
++
++```js
++{
++    "type": "movie",
++    "id": "all",
++    "name": "Jellyfin Movies",
++    "extra": [
++        { "name": "skip", "isRequired": false },
++        { "name": "search", "isRequired": false }
++    ]
++},
++{
++    "type": "series",
++    "id": "all",
++    "name": "Jellyfin Series",
++    "extra": [
++        { "name": "skip", "isRequired": false },
++        { "name": "search", "isRequired": false }
++    ]
++}
++```
++
++And a small follow-on guard in `jellyfin.js`, since `skip` can now legitimately be omitted by a stricter client:
++
++```js
++// was: let firstItem = Number(skip) + 1   (NaN if skip is undefined)
++let firstItem = (Number(skip) || 0) + 1
++```
++
++**Verified live** before pushing (per the deploy-test-then-push workflow used throughout this project): manifest returns 200 with both catalog `name` fields present, `catalog/movie/all.json` returns 14 metas with zero missing ids, stderr log clean, and — after a full remove-and-re-add of the addon in Nuvio — both catalogs appeared correctly. Pushed as commit `c1e1802`.
++
++**Takeaway for future manifest changes:** Stremio's own client is a poor test of manifest correctness — it tolerates missing required fields that a spec-compliant or simply stricter client (Nuvio, and likely others) will not. Validate new catalogs against the full required-field list (`type`, `id`, `name`) even though Stremio itself won't complain if you get it wrong.
++
++## 9. Exposing the addon publicly — the Tailscale/Cloudflare investigation
++
++The original plan was to expose this addon via Tailscale instead of the nginx-reverse-proxy pattern used for other addons, to avoid path-prefix issues that had broken manifest generation for other addons in the past. This required real investigation rather than assumption.
++
++### 9.1 Tailscale — doesn't work on this account
++
++Tailscale needs a real `/dev/net/tun` network interface to route traffic, which normally requires root. Testing revealed:
++
++- `/dev/net/tun` is unusually world-writable (`crw-rw-rw-`) on this seedbox — a rare, favorable sign.
++- However, actually creating the named TUN interface Tailscale needs (`tstun.New("tailscale0")`) requires the `CAP_NET_ADMIN` capability, which a non-root process does not have regardless of the device file's permissions. Confirmed directly:
++  ```
++  wgengine.NewUserspaceEngine(tun "tailscale0") error: tstun.New("tailscale0"): operation not permitted
++  ```
++- Tailscale's fallback **userspace networking mode** avoids needing `CAP_NET_ADMIN`, but by design it only provides *outbound* connectivity (a local SOCKS5/HTTP proxy for this machine to reach the tailnet) — it cannot *serve* a local port to other tailnet members. This rules it out for the actual goal (letting a Stremio client reach the addon).
++- Tailscale Funnel/Serve (the public-exposure features) were also investigated, but both proxy traffic *to* the local `tailscaled` node — meaning the seedbox itself must be a functioning tailnet node first. There's no way to "reach in" from a different device's Tailscale node, since the architecture requires the serving device to hold its own tailnet identity and interface.
++
++**Conclusion: Tailscale cannot expose a service on this non-root Ultra.cc account, in any mode.**
++
++### 9.2 Cloudflare Tunnel — works, but needs a permanent hostname
++
++Unlike Tailscale, Cloudflare Tunnel's `cloudflared` binary makes purely **outbound** HTTPS/QUIC connections to Cloudflare's edge — no TUN device, no elevated capabilities. This was tested and confirmed working:
++
++```bash
++curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
++chmod +x cloudflared
++./cloudflared tunnel --url http://127.0.0.1:19999
++```
++
++This produced a real public HTTPS URL, and an external fetch of that URL correctly reached a local test server on the seedbox — full proof the mechanism works without root.
++
++The catch: the free `trycloudflare.com` quick-tunnel used for this test issues a **random hostname on every restart** — unsuitable for a permanent Stremio addon URL (you'd have to re-add the addon in Stremio every time the tunnel process restarts, e.g. after any crash, reboot, or auto-update). A permanent named tunnel requires adding a real domain to a Cloudflare account (domain purchase, or a Cloudflare-compatible free-subdomain service like `is-a.dev`, which requires a manual GitHub PR review — not instant).
++
++### 9.3 Final answer: DuckDNS + direct port exposure
++
++Given the constraints, the simplest and most robust solution turned out to not need Tailscale or Cloudflare at all:
++
++1. **DuckDNS** (duckdns.org) provides a genuinely free, instant, permanent subdomain (`<name>.duckdns.org`) that's a plain A-record pointed at the seedbox's public IP — no tunnel, no proxy, no approval process.
++2. The addon is exposed on its **own dedicated port** (5010), the exact same pattern already proven to work for Sootio, StremThru, and MediaFusion-API on this seedbox. This avoids the nginx-subpath issue entirely (no `/subpath` prefix means no manifest-path-mangling bug).
++
++```bash
++curl -s "https://www.duckdns.org/update?domains=<name>&token=<token>&ip=<public-ip>"
++```
++
++**Important gotcha hit during setup:** DuckDNS's own dashboard auto-detected an incorrect IP (`49.205.43.134`) when the domain was first created — likely a stale/incorrect detection from the browser session. The correct IP was confirmed by resolving `vgupta1192.peak.usbx.me` (the seedbox's known-working domain) via a public DNS-over-HTTPS query and cross-checking it matched `ifconfig.me`'s output from the seedbox itself. Always verify the IP DuckDNS actually stores, don't trust its auto-detection blindly.
++
++Final manifest URL:
++
++```
++http://vgupta1192.duckdns.org:5010/manifest.json
++```
++
++## 10. Full systemd unit
++
++```ini
++# ~/.config/systemd/user/stremio-jellyfin.service
++[Unit]
++Description=Stremio Jellyfin Addon
++After=network.target
++
++[Service]
++Type=simple
++WorkingDirectory=%h/apps/stremio-jellyfin
++Environment=SERVER_PORT=5010
++Environment=JELLYFIN_SERVER=http://127.0.0.1:11102/jellyfin
++Environment=PUBLIC_JELLYFIN_SERVER=https://vgupta1192.peak.usbx.me/jellyfin
++Environment=JELLYFIN_USER=<jellyfin-username>
++Environment=JELLYFIN_PASSWORD=<jellyfin-password>
++Environment=PUBLIC_ADDON_URL=https://vgupta1192.peak.usbx.me/stremio-jellyfin
++Environment=SEERR_URL=https://vgupta1192.peak.usbx.me/seerr
++Environment=SEERR_API_KEY=<seerr-api-key>
++ExecStart=/home/<user>/.nvm/versions/node/v24.19.0/bin/node server.js
++Restart=on-failure
++RestartSec=5
++StandardOutput=file:%h/apps/logs/stremio-jellyfin/stremio-jellyfin-stdout.log
++StandardError=file:%h/apps/logs/stremio-jellyfin/stremio-jellyfin-stderr.log
++
++[Install]
++WantedBy=default.target
++```
++
++```bash
++chmod 600 ~/.config/systemd/user/stremio-jellyfin.service   # contains a plaintext password
++systemctl --user daemon-reload
++systemctl --user enable --now stremio-jellyfin.service
++```
++
++## 11. Monitoring integration
++
++Wired into the same infrastructure every other addon on this seedbox uses:
++
++- **watchdog.sh** — added to the `SERVICES` array with health-check URL `http://127.0.0.1:5010/manifest.json` expecting `^200$`. Runs every 5 minutes; auto-restarts on failure with a 60s cooldown between attempts.
++- **auto-update.sh** — added `update_stremio_jellyfin()` calling the shared `update_git_app` helper (git fetch/pull if changed → `npm install` → restart service → health-check → auto-rollback via `git reset --hard` on failure).
++- **seedbox-check / full-check.sh** — added to the systemd-services list, local HTTP health check, and public-URL check sections.
++- **rotate-app-logs.sh** — no changes needed; the script already walks `~/apps/logs/*/*.log` as a wildcard, so `~/apps/logs/stremio-jellyfin/*.log` is automatically covered (2MB rotation threshold, 7-day retention, with the standard "restart the owning service after rotation" step since this is a persistent process holding an open file descriptor to its log path).
++
++## 12. Verification checklist
++
++```bash
++# service is up
++systemctl --user status stremio-jellyfin.service
++
++# manifest reachable locally
++curl -s http://127.0.0.1:5010/manifest.json
++
++# manifest reachable publicly, permanent hostname
++curl -s http://vgupta1192.duckdns.org:5010/manifest.json
++
++# catalog returns real Jellyfin library items
++curl -s http://127.0.0.1:5010/catalog/movie/all.json
++
++# meta lookup by IMDb id returns real data (not null)
++curl -s http://127.0.0.1:5010/meta/movie/tt0322259.json
++
++# stream lookup returns a real, publicly-reachable playback URL
++curl -s http://127.0.0.1:5010/stream/movie/tt0322259.json
++
++# monitoring picks it up
++seedbox-check | grep stremio-jellyfin
++```
++
++To install in Stremio: **Settings → Addons → Community Addons → paste manifest URL**:
++
++```
++http://vgupta1192.duckdns.org:5010/manifest.json
++```
++
++The same URL works for Nuvio (Settings → Addons → Add addon → paste manifest URL) as of commit `c1e1802` — earlier commits will fail to load any catalogs in Nuvio specifically, per Bug #6 above.
++
++## 13. "Request via Seerr" — one-click requests for missing titles
++
++Previously, if a title wasn't yet in the Jellyfin library, `defineStreamHandler` just returned an empty `streams: []` — a dead end in the client, with no path from "not available" to "downloaded and streaming."
++
++**Why Seerr, not Jellyseerr:** Jellyseerr and Overseerr were both officially deprecated in February 2026, merged by their own dev team into a single unified project called **Seerr** (final sunset for both predecessors: end of May 2026). Seerr is the same codebase, not a rewrite, and its request API (`X-Api-Key` auth, `POST /api/v1/request`) is unchanged from Overseerr/Jellyseerr's long-stable contract — so this integration targets Seerr directly rather than building against a project already being sunset.
++
++**New module — `seerr.js`:** mirrors `jellyfin.js`'s client pattern. `requestMedia(tmdbId, mediaType)` calls `POST /api/v1/request` — for TV, requesting all seasons (`seasons: "all"`), since Stremio's per-episode granularity doesn't map cleanly onto a one-click "request this show" action.
++
++**Bug hit and fixed during testing — duplicate requests on repeat clicks.** Live testing showed tapping "Request via Seerr" twice on the same title (22 seconds apart) created TWO separate "Requested" entries in Seerr instead of the second one being rejected. Root cause, confirmed by reading Seerr's actual source (`server/entity/MediaRequest.ts`, same in `seerr-team/seerr`/`fallenbagel/jellyseerr`/`sct/overseerr` - the duplicate check is unchanged across the fork lineage): the "does a request already exist" check is a plain `SELECT` immediately followed by an `INSERT`, with no database transaction, no unique constraint on `(tmdbId, mediaType, is4k)`, and no locking - two POSTs close together can both pass the SELECT before the first one's row commits. This addon's original 409-based dedup assumed Seerr's own check was reliable; it isn't. **Fix, in `seerr.js`:** `requestMedia()` now guards against duplicates two ways before ever POSTing: (1) an in-memory `Map` tracking `tmdbId:mediaType` combos requested by this addon process in the last 30 seconds - instant, no network call, catches the exact "impatient repeat tap" scenario that caused the bug; (2) a live pre-check against Seerr's own `GET /api/v1/movie/{tmdbId}` (or `/tv/{tmdbId}`) endpoint, inspecting `mediaInfo.status` (skip if `AVAILABLE`/`PARTIALLY_AVAILABLE`) and `mediaInfo.requests[]` (skip if any entry has status `PENDING`/`APPROVED`) - this catches "already requested in a previous process lifetime" (e.g. after a restart cleared the in-memory guard), which the in-memory check alone can't. **A second bug was hit while building this fix**: the pre-check's first version omitted the `/api/v1` prefix on its request path and shared the same 15-second timeout as every other Seerr call - live testing showed a single `/request` call taking over 20 seconds and returning a 502, because the mis-pathed pre-check call hung for the full 15s before falling through to the real POST. Fixed by correcting the path and giving the pre-check its own dedicated 3-second timeout (`precheckClient`, separate axios instance from `client`) - since the pre-check is a nice-to-have optimization layered on top of the in-memory lock (the actual primary guard), it's fine for it to fail/skip fast rather than block the whole request. Verified live: two rapid requests for the same fresh title (`tt0110357`, The Lion King) resolved in 2.8s and 0.38s respectively (the second hitting the in-memory lock, never reaching Seerr), and Seerr's Requests page confirmed exactly one entry was created.
++
++**Bug hit and fixed during testing — IMDb-to-TMDb resolution:** the first implementation of `findByImdbId()` searched Seerr's own `/api/v1/search?query=<imdbId>` endpoint, assuming TMDb's search backend would resolve a raw IMDb-id-shaped string directly. Live testing (`tt0068646`, The Godfather — an unambiguous, definitely-indexed title) proved this wrong: `/search` is confirmed (by reading Seerr's own source, `server/routes/search.ts` / `server/api/themoviedb/index.ts`) to be a plain title-text search against TMDb's `/search/multi`, with no external-id matching at all — it silently returned zero relevant results for an ID-shaped query. **Fix:** call TMDb's own `/find/{imdbId}?external_source=imdb_id` endpoint directly instead (the same endpoint Seerr's backend uses internally via `getMediaByImdbId()`/`getByExternalId()`, confirmed in `server/api/themoviedb/index.ts` — it's just never exposed as its own public Seerr route). This uses TMDb's own public "read" API key, which Seerr/Overseerr/Jellyseerr all ship hardcoded in their own open-source repos (`431a8708161bcd1f1fbe7536137e61ed`) — not a secret tied to this deployment, so no separate TMDb account/key registration is needed. Overridable via an optional `TMDB_API_KEY` env var if you'd rather use your own.
++
++**Bug hit and fixed during testing — stale/invalid Seerr API key:** the first API key copied from Seerr's Settings → General page 403'd on `/api/v1/search` (and every other authenticated endpoint) while the unauthenticated `/api/v1/status` and `/api/v1/settings/public` endpoints worked fine — confirmed via direct `curl` (bypassing this addon entirely) and by reading Seerr's own auth middleware (`server/middleware/auth.ts`): it does a strict `req.header('X-API-Key') === settings.main.apiKey` string comparison, and a mismatch means `req.user` never gets set, causing every permission check downstream to 403 regardless of which permission is actually required. Regenerating the key in Seerr's UI and using the fresh value fixed it immediately — the original key had simply gone stale/invalid server-side.
++
++**Stream-handler change — `addon.js`:** when no Jellyfin item is found (movie or episode), instead of returning `streams: []`, a fallback stream entry is returned:
++
++```js
++{
++    name: "Seerr",
++    title: "Request via Seerr",
++    description: "Request via Seerr",
++    url: `${publicSelfUrl}/request/${type}/${imdbId}`,
++    behaviorHints: { notWebReady: true }
++}
++```
++
++**Design history — three iterations, only the third one actually works. Read this before changing anything here again.**
++
++*Iteration 1 — `externalUrl` pointing at a confirmation-page route.* Assumption: this is the standard way to expose a non-playback action link. Wrong — per the Stremio addon spec, `externalUrl` is **always** opened outside the app (system browser) in every Stremio-protocol client, confirmed live in Nuvio on both desktop and mobile. There's no spec-level "open a webpage inside the app" stream type.
++
++*Iteration 2 — switched to `url`, held the HTTP connection open for up to 5 minutes while polling Jellyfin internally, then either 302-redirected to the real stream or responded with a timeout error.* This seemed reasonable (a player opening `stream.url` should tolerate a slow-to-respond connection, the same way a slow torrent resolve would) but was proven wrong by live testing: the "5 minute timeout" error never appeared and even the real file (ready ~11 minutes later) never played — the player was just stuck on "loading" forever. Root cause, confirmed by reading Nuvio's own source (`PlayerPlaybackNetworking.kt` in both `NuvioTV-dev` and `NuvioMobile-cmp-rewrite`): Nuvio's OkHttp-backed playback client uses a **15-second** connect/read/write timeout, with ExoPlayer's own retry/backoff policy giving up entirely around 90-100 seconds — nowhere close to 5 minutes. A connection that sends zero bytes for that long fails almost immediately from the player's perspective, it just doesn't surface a visible error because retries silently absorb it for a while.
++
++*Iteration 3 (attempted, also rejected before implementation) — redirect-loop: respond fast every few seconds with a 302 back to the same endpoint, carrying the original start time forward, until ready or timed out.* This looked like the fix (every individual response is fast, well under 15s) but research into the actual player HTTP stacks killed it before it was ever deployed: OkHttp (used by ExoPlayer/Nuvio) hard-caps at **20** redirect follow-ups (`RetryAndFollowUpInterceptor.MAX_FOLLOW_UPS`), and ffmpeg/mpv (used by Stremio's own libmpv player) caps at **8** by default (`HTTP_MAX_REDIRECTS_DEFAULT`). A 5-minute wait at a few seconds per hop needs 70+ redirects — both players would hard-fail with a protocol error around hop 8-20, long before either the timeout or the real file could ever be reached.
++
++**Final design (iteration 4, deployed and working) — respond immediately with a short static placeholder video, no polling or redirecting of any kind.** The underlying realization: no single HTTP response can both stay open for minutes *and* later swap to a different real video file — players don't support hot-swapping content mid-stream, so trying to make the "wait" and the "play" happen in one request was never going to work cleanly. Instead, `GET /request/:type/:imdbId/:season?/:episode?` now:
++
++1. Does one quick check (sub-second) — if the title is somehow already available (e.g. reopening after it finished downloading, before the client's own cache refreshed), redirects straight to the real Jellyfin stream immediately.
++2. Otherwise submits the request to Seerr (tolerating Seerr's `409 already requested` as the expected case on every subsequent open of the same title while it's still downloading).
++3. Responds immediately (typically ~1-2 seconds total) with `res.sendFile()` serving a small static placeholder video (`assets/requested-placeholder.mp4`, ~30KB, 10s silent clip with "Requested via Seerr, still downloading..." burned in as text via ffmpeg's `drawtext` filter — generated once directly on the seedbox: `ffmpeg -f lavfi -i color=... -f lavfi -i anullsrc=... -vf drawtext=... -shortest -c:v libx264 -c:a aac assets/requested-placeholder.mp4`). This is a normal, fast, complete file response, not a hanging connection, so it can't trip any player's read timeout.
++
++**The UX tradeoff this accepts:** there is no automatic transition from "placeholder" to "real stream" mid-playback. The user has to manually reopen the title later, once it's actually downloaded — at which point `defineStreamHandler`'s normal fast path in `addon.js` finds the real Jellyfin item and returns it directly, exactly like any title that was already in the library, no extra plumbing needed. This was a deliberate, evidence-based tradeoff after two more "seamless" designs were tried and both proven to fail against real player constraints — a placeholder that plays cleanly and a manual reopen is strictly better than a loading spinner that never resolves.
++
++**Confirmed working end-to-end in Nuvio** (both the placeholder plays immediately without error, and reopening the title after the real download completes correctly shows the real Jellyfin stream).
++
++**New dependency:** `express` was already a transitive dependency of `stremio-addon-sdk` (confirmed via its own `package.json`), but is now also declared directly in this project's `package.json` since `server.js` builds its own Express app (`getRouter(addonInterface)` mounted the same way `serveHTTP` does internally — confirmed by reading the SDK's own source, `src/serveHTTP.js` — plus the new `/request` route, which `serveHTTP` has no hook for).
++
++**New environment variables:**
++
++```ini
++Environment=SEERR_URL=https://seerr-vgupta1192.peak.usbx.me
++Environment=SEERR_API_KEY=<seerr-api-key>
++Environment=PUBLIC_ADDON_URL=http://vgupta1192.duckdns.org:5010
++```
++
++- `SEERR_URL` / `SEERR_API_KEY` — Seerr's public base URL. Note this ended up being a **distinct subdomain** (`seerr-vgupta1192.peak.usbx.me`), not the `vgupta1192.peak.usbx.me/<app>` URL-Base subpath pattern used for Radarr/Sonarr/Jellyfin on this seedbox — confirm the actual working pattern for your own Seerr instance rather than assuming it matches other apps. API key from Seerr's **Settings → General → API Key**.
++- `PUBLIC_ADDON_URL` — this addon's own publicly-reachable base URL, needed so the `url` link built for the Stremio/Nuvio client (not this server itself) is actually reachable by whatever device opens it. Falls back to `http://127.0.0.1:<SERVER_PORT>` if unset (fine for local testing, not for a real client).
++- If `SEERR_URL`/`SEERR_API_KEY` are left unset, `seerr.enabled` is `false` and the addon silently falls back to the old behavior (`streams: []` when nothing is found) rather than showing a broken request link — this is a deliberate no-crash fallback, not an error state.
++
++**Bug hit and fixed during testing — stale/invalid Seerr API key:** the first API key copied from Seerr's Settings → General page 403'd on every authenticated endpoint while unauthenticated endpoints worked fine — confirmed via direct `curl` and by reading Seerr's own auth middleware (`server/middleware/auth.ts`): a strict `req.header('X-API-Key') === settings.main.apiKey` string comparison, where any mismatch means `req.user` never gets set and every downstream permission check 403s regardless of which permission is actually required. Regenerating the key in Seerr's UI fixed it immediately — the original key had simply gone stale/invalid server-side, this was not a copy/paste or encoding issue.
++
++**Bug hit and fixed during testing — IMDb-to-TMDb resolution:** the first implementation of `findByImdbId()` searched Seerr's own `/api/v1/search?query=<imdbId>` endpoint. Live testing (`tt0068646`, The Godfather) proved this wrong: `/search` is confirmed (by reading Seerr's own source) to be a plain title-text search against TMDb's `/search/multi`, with no external-id matching at all. **Fix:** call TMDb's own `/find/{imdbId}?external_source=imdb_id` endpoint directly, using TMDb's own public "read" API key that Seerr/Overseerr/Jellyseerr all ship hardcoded in their own open-source repos (`431a8708161bcd1f1fbe7536137e61ed`) — not a secret, no separate TMDb account needed. Overridable via an optional `TMDB_API_KEY` env var.
++
++**Bug hit after deploying the `url`-based redesign — full regression, all streams (not just Seerr fallback ones) returning `{"err":"handler error"}`, Stremio crashing repeatedly on the addon.** Root-caused via a truncate-log-then-single-request sequence to a clean `AxiosError: 401 Unauthorized` from Jellyfin's own `/Items` endpoint — Jellyfin itself was confirmed healthy (`/System/Ping` returned `200`), isolating the problem to this addon process's own cached auth token. `jellyfin.js`'s `authenticate()` only ever ran once, at process startup (`const jellyfin = new JellyfinApi(); await jellyfin.authenticate()` at the top of `addon.js`) — if Jellyfin invalidates/rotates that session token at any point after that (server restart, session expiry, etc.), every single subsequent request from the long-running addon process 401s, with no retry or recovery. A plain `systemctl --user restart` confirmed this diagnosis (forcing a fresh `authenticate()` call immediately fixed it), but that's a manual workaround, not a fix. **Real fix:** `jellyfin.js` now routes every Jellyfin API call through a shared `authenticatedGet(url)` wrapper. On any `401`, it calls `authenticate()` again (fetching a fresh token) and retries the exact same request once before giving up — the addon now self-heals from a stale token automatically, with no manual restart needed.
++
++### 13.1 Verification checklist for this feature
++
++```bash
++# 1. Confirm the placeholder video was generated
++ls -la ~/apps/stremio-jellyfin/assets/requested-placeholder.mp4
++# expect: a real file, ~30KB
++
++# 2. Pick a real IMDb id NOT currently in your Jellyfin library, confirm the
++#    stream handler returns the request-fallback entry instead of an empty list
++curl -s http://127.0.0.1:5010/stream/movie/<imdb-id-not-in-library>.json
++# expect: streams[0].name === "Seerr", streams[0].url set (not externalUrl)
++
++# 3. Confirm the /request endpoint responds FAST with real video bytes, not
++#    a hang - this is the whole point of the final design
++time curl -s -o /tmp/test.mp4 -w "HTTP %{http_code}, %{size_download} bytes, %{time_total}s\n" \
++  http://127.0.0.1:5010/request/movie/<imdb-id-not-in-library>
++# expect: HTTP 200, ~30000 bytes, well under 5 seconds
++
++# 4. Confirm a title ALREADY in the library still returns a normal direct
++#    Jellyfin stream (not a Seerr fallback) - regression check for the
++#    auth-wrapper refactor
++curl -s http://127.0.0.1:5010/stream/movie/<imdb-id-already-in-library>.json
++# expect: streams[0].name === "Jellyfin", streams[0].url points at Jellyfin
++
++# 5. Click through in Nuvio itself: open a missing title, tap "Request via
++#    Seerr", confirm the placeholder plays immediately with no browser hop
++#    and no error, and the request appears in Seerr's own Requests queue
++
++# 6. Confirm the existing pipeline picks it up: Radarr/Sonarr fetches it,
++#    lands in Jellyfin, and manually reopening the SAME title later shows
++#    the real Jellyfin stream instead of the placeholder - confirmed working
++#    live (Nuvio)
++```
++
++### 13.2 Known open issue — Stremio's own client still doesn't show the entry
++
++**Confirmed still broken as of the final placeholder-video design.** The "Request via Seerr" stream entry displays correctly in Nuvio (desktop and mobile) but does not appear at all in the official Stremio app (tested on Mac desktop and Android mobile), even after fully removing and re-adding the addon, and even after testing three different `behaviorHints`/`description` variations.
++
++**What's been ruled out, in order:**
++
++1. **Addon-side caching** — ruled out. Removing and fully re-adding the addon in Stremio was tested multiple times across different code versions; the entry still never appears.
++2. **The endpoint not actually returning the entry** — ruled out. Confirmed via direct `curl` against `/stream/movie/<id>.json` that the JSON response correctly includes the Seerr stream object every time.
++3. **Stremio not even reaching the addon for that title** — ruled out. Confirmed via live server-log capture (truncate stdout log, open the title in Stremio, check the log) that Stremio does request `/stream/movie/<id>.json` and the addon does respond.
++4. **`behaviorHints.notWebReady`** — tested both `false` and `true`. Neither made any difference.
++5. **Long, sentence-style `description` text confusing some UI-side quality/filename parser** — tested shortening `description` to a plain `"Request via Seerr"` string (matching the `name`/`title` style of a normal addon stream). No difference.
++6. **`stremio-core`'s own Rust logic (shared by macOS desktop and Android, confirmed by reading the actual source, `src/types/resource/stream.rs` and `src/deep_links/mod.rs` in `Stremio/stremio-core`)** — ruled out as the filtering layer. `Stream::streaming_url()` passes any non-`magnet:` URL through unmodified regardless of scheme, host, or port; there is no file-extension check anywhere in the stream-resolution path; `StreamSource` is an untagged serde enum that cleanly matches a plain `{"url": ...}` object as its `Url` variant, and every downstream deep-link/player-URL builder (`ExternalPlayerLink::from()`, `StreamDeepLinks::player`) populates unconditionally for it. In other words: Stremio's shared core never drops this stream — whatever is filtering it out is happening in the UI rendering layer (`stremio-web`'s React code, or platform-specific list rendering in the desktop/Android shells), which has not yet been located in source.
++
++**Current status: unresolved, deprioritized.** The feature is fully functional end-to-end via Nuvio, which was confirmed as the primary client this was built for. If this needs to be revisited: the next concrete step would be pulling `stremio-web`'s actual stream-list rendering component (not `stremio-core`) and diffing its behavior against a known-working addon's stream response field-by-field, since the shared Rust core has now been conclusively ruled out as the cause.
++
++## Commit history
++
++| Commit | Description |
++| --- | --- |
++| `988e7e0` | Fix Jellyfin API integration for modern Jellyfin servers (auth base-path, plugin replacement, meta handler) |
++| `c1e1802` | Fix Nuvio catalog visibility: add required catalog `name` field, relax `skip` `isRequired`, filter items missing IMDb id |
++| _(pending)_ | Add "Request via Seerr" fallback stream (`url`-based, static placeholder video response, not `externalUrl` or a blocking poll/redirect-loop) for titles missing from Jellyfin, using TMDb's `/find` endpoint for exact IMDb-id resolution, plus retry-on-401 auto re-authentication in `jellyfin.js`. Confirmed working end-to-end in Nuvio; Stremio's own client still doesn't display the entry (see 13.2, unresolved) |
+diff --git a/Dockerfile b/Dockerfile
+index 0a67a76..aafebc6 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -10,6 +10,7 @@ WORKDIR /home/node/app
+ 
+ COPY package*.json ./
+ COPY *.js ./
++COPY assets ./assets
+ 
+ RUN chown -R node:node /home/node/app
+ 
+diff --git a/addon.js b/addon.js
+index dc1135e..afd41f1 100644
+--- a/addon.js
++++ b/addon.js
+@@ -1,9 +1,25 @@
+ // noinspection JSPotentiallyInvalidConstructorUsage
+ 
++import fs from "fs"
++import path from "path"
+ import Promise from "es6-promise"
+ import {addonBuilder} from "stremio-addon-sdk"
+-import {JellyfinApi, server} from "./jellyfin.js";
+-import {manifest} from "./manifest.js";
++import {JellyfinApi, server, moviesLibraryId, showsLibraryId, adultLibraryId} from "./jellyfin.js";
++import {createManifest, configToSlug, ALL_CONFIGS} from "./manifest.js";
++import {seerr} from "./seerr.js";
++
++// Client-facing URLs (poster images, stream links) must use the publicly
++// reachable Jellyfin address, since they're opened by the Stremio client,
++// not by this addon's own server. Falls back to the internal server value
++// if no public address is configured.
++const publicServer = process.env.PUBLIC_JELLYFIN_SERVER || server
++
++// Public URL of THIS addon's own server, used to build the "Request via
++// Seerr" stream URL (the /request route, which the player opens directly
++// like any other stream). Must be reachable by whatever device opens the
++// Stremio/Nuvio client (same reasoning as publicServer above) - falls back
++// to the internal SERVER_PORT-based localhost URL for local dev.
++const publicSelfUrl = (process.env.PUBLIC_ADDON_URL || `http://127.0.0.1:${process.env.SERVER_PORT || 60421}`).replace(/\/+$/, "")
+ 
+ const jellyfin = new JellyfinApi()
+ await jellyfin.authenticate()
+@@ -15,74 +31,350 @@ function stringToUuid(plainStringUuid) {
+     )
+ }
+ 
+-let builder = new addonBuilder(manifest)
++// Tracks which items have already had a background image refresh
++// triggered this process lifetime, so a catalog page rendered repeatedly
++// (every poll/scroll) doesn't re-request one every single time - one
++// attempt per item per restart is enough to either pick up a fix or
++// confirm there's nothing to extract.
++const imageRefreshTriggered = new Set()
++
++// Stremio queries EVERY installed addon for a stream, regardless of which
++// addon's catalog the user actually found the title through - so a
++// content id from a completely unrelated addon's catalog (confirmed live,
++// 2026-09-16: an "OnlyPorn" addon) reaches this addon's stream handler
++// exactly the same as one from this addon's own Movie/Series catalogs.
++//
++// A whitelist populated only from titles this addon's own catalog has
++// listed (tried right after the above bug) turned out to be broken for the
++// opposite reason: buildRequestStream only ever runs when a title is NOT
++// found in Jellyfin, but the catalog handler only ever lists titles that
++// ARE already in Jellyfin - so a genuinely missing movie/series (exactly
++// the case Seerr exists for) could never get onto that whitelist in the
++// first place, silently breaking Seerr for every not-yet-downloaded title,
++// confirmed live 2026-09-16.
++//
++// So this is a blacklist again, but a narrower one than the original:
++// adultItemIds (ids seen via this addon's own Adult catalog) covers this
++// addon's own adult content, and isRequestableItemId additionally requires
++// a real "tt<digits>" IMDb id shape. That second check is what closes the
++// OnlyPorn-style leak: Seerr's own lookup (seerr.findByImdbId) only ever
++// works from a real IMDb id anyway, so a non-"tt" id from some other
++// addon's own custom id scheme was never going to resolve on Seerr even
++// before this fix - excluding it here isn't a functionality loss, and it
++// also happens to be the only titles a foreign adult addon would plausibly
++// send (adult content is essentially never IMDb-catalogued). Genuine
++// mainstream movies/series - from this addon's own catalogs or any other
++// addon - keep working via their real "tt" id, matching every catalog they
++// might be browsed from.
++//
++// Persisted to disk: in-memory-only tracking doesn't survive this addon's
++// own periodic restarts (log rotation, deploys), and Stremio doesn't
++// necessarily re-list a catalog before reopening a title it already has
++// cached client-side - see the 2026-09-16 incident this replaces.
++const ADULT_ITEM_IDS_FILE = path.join(process.cwd(), "data", "adult-item-ids.json")
++const adultItemIds = new Set(loadAdultItemIds())
++const IMDB_ID_RE = /^tt\d+$/
++
++function loadAdultItemIds() {
++    try {
++        return JSON.parse(fs.readFileSync(ADULT_ITEM_IDS_FILE, "utf8"))
++    } catch {
++        return []
++    }
++}
++
++function saveAdultItemIds() {
++    try {
++        fs.mkdirSync(path.dirname(ADULT_ITEM_IDS_FILE), {recursive: true})
++        fs.writeFileSync(ADULT_ITEM_IDS_FILE, JSON.stringify([...adultItemIds]))
++    } catch (err) {
++        console.error("Failed to persist adultItemIds:", err?.message || err)
++    }
++}
+ 
++// "jf<itemId>" fallback for items TheMovieDb couldn't confidently match to
++// an IMDb id (common for adult content and obscure/mistitled files) - see
++// getItemByAnyId in jellyfin.js for the corresponding lookup. No colon in
++// either form, so it never collides with the "seriesId:season:episode"
++// shape defineStreamHandler splits on below.
+ function itemToMeta(item) {
++    const hasPoster = !!item.ImageTags?.Primary
++    // Omitting `poster` entirely (rather than pointing at an Images/Primary
++    // URL that 404s) lets Stremio's own UI fall back to its normal
++    // no-poster placeholder instead of a broken black box - confirmed live
++    // this was rendering as pitch black for items with no Primary image.
++    // Kick off a one-time background refresh so Jellyfin's own image
++    // fetchers (including a screen-grab from the video as a last resort)
++    // get a chance to backfill a real poster for any future item this
++    // happens to - see refreshItemImages in jellyfin.js.
++    if (!hasPoster && !imageRefreshTriggered.has(item.Id)) {
++        imageRefreshTriggered.add(item.Id)
++        jellyfin.refreshItemImages(item.Id)
++    }
+     return {
+-        id: item.ProviderIds.Imdb,
++        id: item.ProviderIds?.Imdb || `jf${item.Id}`,
+         type: item.Type.toLowerCase(),
+         name: item.Name,
+-        poster: `${server}/Items/${item.Id}/Images/Primary`
++        ...(hasPoster ? {poster: `${publicServer}/Items/${item.Id}/Images/Primary`} : {})
++    }
++}
++
++// For series, adds the "videos" (episode) list Stremio's UI needs to show
++// a season/episode picker instead of a bare "Play" button. A real IMDb-id
++// series gets this for free from Cinemeta (or another metadata addon that
++// recognizes "tt..." ids) merging its own richer response in - but nothing
++// else on earth recognizes our own "jf<itemId>" fallback ids, so for those
++// this addon is the *only* possible source of an episode list. Without it,
++// confirmed live: Stremio falls back to treating the whole series as one
++// single playable item, exactly like a movie.
++//
++// Built from getCanonicalEpisodeList so the video ids handed to the client
++// use the exact same season/episode numbering resolveEpisode expects back
++// in defineStreamHandler - they're built from the same source, so they
++// can't disagree with each other.
++async function buildDetailedMeta(item) {
++    const meta = itemToMeta(item)
++    if (item.Type !== 'Series') return meta
++    const episodes = await jellyfin.getCanonicalEpisodeList(item.Id)
++    meta.videos = episodes.map(({seasonNum, episodeNum, item: ep}) => ({
++        id: `${meta.id}:${seasonNum}:${episodeNum}`,
++        title: ep.Name || `Episode ${episodeNum}`,
++        season: seasonNum,
++        episode: episodeNum,
++        ...(ep.PremiereDate ? {released: ep.PremiereDate} : {})
++    }))
++    return meta
++}
++
++// Scopes each catalog id to its own Jellyfin library, so e.g. the Adult
++// library's content (CollectionType=movies, so it scans/matches properly)
++// shows up only in its own "Adult" catalog and not also in "Jellyfin
++// Movies" - Items?IncludeItemTypes=Movie with no ParentId searches every
++// library on the server at once.
++const CATALOG_LIBRARY_IDS = {
++    'movie:all': moviesLibraryId,
++    'series:all': showsLibraryId,
++    'movie:adult': adultLibraryId,
++}
++
++// Builds the fallback "Request via Seerr" stream entry shown when a title
++// isn't in the Jellyfin library yet.
++//
++// This uses `url` (a real playable-stream URL), NOT `externalUrl`. Per the
++// Stremio addon spec, externalUrl always opens outside the app (browser/
++// webview) in every client - there is no "open a webpage inside the app"
++// stream type, confirmed live in Nuvio (both desktop and mobile) opening an
++// externalUrl in the system browser even though the goal was to stay in-app.
++//
++// The URL below points at server.js's /request route, which submits the
++// Seerr request and responds immediately with a short placeholder video
++// explaining what's happening - it does NOT hold the connection open or
++// redirect-loop waiting for the download, since both of those were tried
++// and proven broken by real player timeout/redirect-count limits (see the
++// DESIGN NOTE in server.js for the full explanation). The user reopens this
++// same title once it's been downloaded and imported into Jellyfin, at which
++// point this function is no longer called at all - defineStreamHandler's
++// normal fast path below finds the real Jellyfin item and returns it
++// directly, same as any other title already in the library.
++//
++// season/episode are only meaningful (and only appended to the URL) for
++// series - movies keep the plain /request/movie/:imdbId shape.
++function buildRequestStream(type, imdbId, season, episode) {
++    if (!seerr.enabled) return null
++    // Only offer to request a title through Seerr if it's a real IMDb id
++    // and not known Adult content - see isRequestableItemId above for why
++    // both checks are needed.
++    if (!isRequestableItemId(imdbId)) return null
++    const path = (season !== undefined && episode !== undefined)
++        ? `/request/${type}/${imdbId}/${season}/${episode}`
++        : `/request/${type}/${imdbId}`
++    return {
++        name: "Seerr",
++        title: "Request via Seerr",
++        // Kept short and plain (not a full explanatory sentence) - testing
++        // whether Stremio's UI (unlike Nuvio) parses/filters the
++        // description looking for filename/quality-like text before
++        // deciding whether to render a stream entry at all. See
++        // DEPLOYMENT_GUIDE.md 13.2 for the investigation.
++        description: "Request via Seerr",
++        url: `${publicSelfUrl}${path}`,
++        behaviorHints: {
++            // Set to true: this URL doesn't serve the actual requested
++            // media (it's a short placeholder video explaining the
++            // request is pending), so it's not a "web ready" stream of the
++            // real content in the spec's sense. Testing whether Stremio's
++            // official client (unlike Nuvio) filters stream entries out of
++            // the list based on this flag - see DEPLOYMENT_GUIDE.md 13.2
++            // for the investigation.
++            notWebReady: true
++        }
++    }
++}
++
++// Builds the same Jellyfin stream URL shape used by defineStreamHandler,
++// exposed so server.js's polling /request endpoint can build an identical
++// redirect URL once a requested title becomes available, without duplicating
++// this URL-construction logic in two places.
++export function buildJellyfinStreamUrl(item) {
++    const itemId = stringToUuid(item.Id)
++    if (itemId === undefined) return null
++    const mediaSource = item.MediaSources?.[0]
++    if (!mediaSource) return null
++    return `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${mediaSource.Id}`
++}
++
++// Resolves a movie or specific episode's Jellyfin item, mirroring the same
++// lookup logic defineStreamHandler uses below. Exposed so server.js's
++// polling /request-status endpoint can check availability using the exact
++// same resolution path (series -> season -> episode) rather than duplicating
++// it, and so the "specific requested episode" (not just "any episode of the
++// season") is what's actually checked, per the product requirement that a
++// season-level request should redirect once the ONE episode the user
++// clicked on is ready, not merely once the season starts appearing at all.
++export async function resolveJellyfinItem(type, imdbId, season, episode) {
++    if (season === undefined || episode === undefined) {
++        const items = await jellyfin.getItemByAnyId(imdbId)
++        return (items && items.length > 0) ? items[0] : null
+     }
++
++    const seriesItem = (await jellyfin.getItemByAnyId(imdbId))[0]
++    if (seriesItem === undefined) return null
++    const episodeItem = await jellyfin.resolveEpisode(seriesItem.Id, Number(season), Number(episode))
++    if (episodeItem === undefined) return null
++    return await jellyfin.getItemById(episodeItem.Id).then(it => it.data)
+ }
+ 
+-builder.defineCatalogHandler(async ({type, id, extra}) => {
+-    console.log("request for catalogs: " + type + " " + id)
+-    return Promise.resolve({
+-        metas: await Promise.all(await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search))
+-            .then(it => it.map(e => itemToMeta(e.data)))
++export {jellyfin}
++
++// Exposed so server.js's /request route (the actual URL a player opens for
++// the "Request via Seerr" stream) can also refuse to submit an id this
++// addon never actually offered Seerr for in the first place (Adult
++// content, or a non-IMDb id from a completely different addon), in case a
++// client ever holds onto a stale stream URL from before that exclusion
++// took effect.
++export function isRequestableItemId(id) {
++    return IMDB_ID_RE.test(id) && !adultItemIds.has(id)
++}
++
++// Builds a complete addon interface for one config (which of Movies/
++// Series/Adult are enabled - see manifest.js). Every config shares every
++// handler unchanged: the catalog handler is already driven purely by the
++// requested catalog `type`/`id` via CATALOG_LIBRARY_IDS, and Stremio only
++// ever requests a catalog id that's actually listed in whichever manifest
++// it fetched - so a config with a given catalog disabled simply never
++// gets asked for it in the first place, with no extra branching needed
++// here.
++function buildInterface(config) {
++    const builder = new addonBuilder(createManifest(config))
++
++    builder.defineCatalogHandler(async ({type, id, extra}) => {
++        console.log("request for catalogs: " + type + " " + id)
++        const parentId = CATALOG_LIBRARY_IDS[`${type}:${id}`]
++        // searchItems() now does its own Imdb filtering internally (on
++        // the full, unpaginated list, before slicing to a page - see
++        // jellyfin.js) and returns plain item objects directly, not
++        // axios responses, so no .data unwrapping or re-filtering is
++        // needed here any more.
++        const items = await jellyfin.searchItems(extra.skip || 0, type === 'movie', extra.search, parentId)
++        const metas = items.map(itemToMeta)
++        // Only the Adult catalog marks ids as known-adult (blacklisted from
++        // Seerr) - see adultItemIds above for why this is a blacklist
++        // rather than a mainstream-catalog whitelist.
++        if (id === 'adult') {
++            const sizeBefore = adultItemIds.size
++            metas.forEach(m => adultItemIds.add(m.id))
++            if (adultItemIds.size !== sizeBefore) saveAdultItemIds()
++        }
++        return Promise.resolve({metas})
+     })
+-})
+ 
+-builder.defineMetaHandler(({type, id}) => {
+-    console.log("request for meta: " + type + " " + id)
+-    return Promise.resolve({meta: null})
+-})
++    builder.defineMetaHandler(async ({type, id}) => {
++        console.log("request for meta: " + type + " " + id)
++        const items = await jellyfin.getItemByAnyId(id)
++        if (items === undefined || items.length === 0)
++            return Promise.resolve({meta: null})
++        return Promise.resolve({meta: await buildDetailedMeta(items[0])})
++    })
+ 
+-builder.defineStreamHandler(async ({type, id}) => {
++    builder.defineStreamHandler(async ({type, id}) => {
+     console.log("request for streams: " + type + " " + id)
+     let items = []
++    let seriesImdbId = null
++    let seasonNum = undefined
++    let episodeNum = undefined
+     if (id.includes(":")) {
+ 
+         // resolve actual episode
+         const resolvedId = id.split(":")
+         const seriesId = resolvedId[0]
+-        const season = Number(resolvedId[1])
+-        const episode = Number(resolvedId[2])
+-
+-        const seriesItem = (await jellyfin.getItemByImdbId(seriesId))[0]
+-        if ((seriesItem === undefined))
+-            return Promise.resolve([])
+-        const seasonItem = (await jellyfin.getSeasonByParentItemIdAndSeasonNumber(seriesItem.Id, season)).Items.find(it => it.IndexNumber === season)
+-        if ((seasonItem === undefined))
+-            return Promise.resolve([])
+-        const episodeItem = (await jellyfin.getEpisodeByItemIdAndSeasonId(seriesItem.Id, seasonItem.Id)).Items.find(it => it.IndexNumber === episode)
+-        if ((episodeItem === undefined))
+-            return Promise.resolve([])
++        seriesImdbId = seriesId
++        seasonNum = Number(resolvedId[1])
++        episodeNum = Number(resolvedId[2])
++
++        const seriesItem = (await jellyfin.getItemByAnyId(seriesId))[0]
++        if (seriesItem === undefined) {
++            const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
++            return Promise.resolve({streams: requestStream ? [requestStream] : []})
++        }
++        const episodeItem = await jellyfin.resolveEpisode(seriesItem.Id, seasonNum, episodeNum)
++        if (episodeItem === undefined) {
++            const requestStream = buildRequestStream(type, seriesImdbId, seasonNum, episodeNum)
++            return Promise.resolve({streams: requestStream ? [requestStream] : []})
++        }
+         const actualEpisodeItem = await jellyfin.getItemById(episodeItem.Id).then(it => it.data)
+ 
+         items = [actualEpisodeItem]
+ 
+     } else
+-        items = await jellyfin.getItemByImdbId(id)
++        items = await jellyfin.getItemByAnyId(id)
+ 
+-    if (items === undefined || items.length === 0)
+-        return Promise.resolve([])
++    if (items === undefined || items.length === 0) {
++        const requestStream = buildRequestStream(type, seriesImdbId || id, seasonNum, episodeNum)
++        return Promise.resolve({streams: requestStream ? [requestStream] : []})
++    }
+ 
+     const item = items[0]
+     const itemId = stringToUuid(item.Id)
++    // MediaStreams (per-track technical info: resolution/codec/language)
++    // can be empty even when MediaSources itself is populated - e.g. a
++    // file Jellyfin's ffprobe hasn't finished analyzing, or errored on -
++    // confirmed live on real, otherwise-playable files (6 across the
++    // Movies/Adult libraries). That's cosmetic only (the stream label),
++    // not a reason to treat an actually-playable file as unavailable, so
++    // it falls back to the item's own name instead of crashing the whole
++    // request - unlike a missing MediaSources entry entirely, which does
++    // mean there's no real file to play and correctly falls through to
++    // the "not found" / Request-via-Seerr path below.
++    const mediaSource = item.MediaSources?.[0]
+ 
+-    if (!(itemId === undefined)) {
++    if (itemId !== undefined && mediaSource) {
++        if (!mediaSource.MediaStreams?.[0]) {
++            console.warn(`[stream-fallback] ${item.Name} (${item.Id}): MediaSources present but MediaStreams empty - Jellyfin likely hasn't finished (or failed) probing this file's technical details. Still playable, just using the item's name as the stream label instead of resolution/codec info. Fix at the source by re-running metadata refresh on this item, if the label matters here.`)
++        }
+         const stream = {
+-            url: `${server}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${item.MediaSources[0].Id}`,
++            url: `${publicServer}/videos/${itemId}/stream.mkv?static=true&api_key=${jellyfin.auth.AccessToken}&mediaSourceId=${mediaSource.Id}`,
+             name: 'Jellyfin',
+-            description: item.MediaSources[0].MediaStreams[0].DisplayTitle
++            description: mediaSource.MediaStreams?.[0]?.DisplayTitle || item.Name
+         }
+         return Promise.resolve({streams: [stream]})
+     }
+ 
+     console.log(`Cant find stream for: ${id}`)
+-    return Promise.resolve({streams: []})
+-})
++    const requestStream = buildRequestStream(type, seriesImdbId || id, seasonNum, episodeNum)
++    return Promise.resolve({streams: requestStream ? [requestStream] : []})
++    })
++
++    return builder.getInterface()
++}
+ 
+-export const addonInterface = builder.getInterface()
++// One interface per config (all 2^3 = 8 combinations of Movies/Series/
++// Adult - see manifest.js), each a genuinely separate installable addon
++// (distinct manifest id) sharing every handler - see server.js for how
++// each is mounted under its own URL prefix (or the root, for the
++// everything-enabled default), and the /configure page that lets the user
++// pick which one to install. Keyed by slug ("" for the root/all-enabled
++// config) so server.js can look up the right interface for each mount
++// point without rebuilding it.
++export const interfacesBySlug = new Map(
++    ALL_CONFIGS.map(config => [configToSlug(config) || "", buildInterface(config)])
++)
+diff --git a/assets/requested-placeholder.mp4 b/assets/requested-placeholder.mp4
+new file mode 100644
+index 0000000000000000000000000000000000000000..bff2e53b43418f0193edfb80b6e64020b9409fb3
+GIT binary patch
+literal 30724
+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
+G^8Wx;^h!Yh
+
+literal 0
+HcmV?d00001
+
+diff --git a/jellyfin.js b/jellyfin.js
+index c000f5b..b4978c9 100644
+--- a/jellyfin.js
++++ b/jellyfin.js
+@@ -7,6 +7,18 @@ const password = process.env.JELLYFIN_PASSWORD
+ const device = os.hostname()
+ const itemsLimit = 20
+ 
++// Library ItemIds used to scope catalog queries to a specific Jellyfin
++// library instead of the whole server - without this, e.g. the Adult
++// library's content (once given CollectionType=movies so it scans
++// properly) would also show up in the main "Jellyfin Movies" catalog,
++// since Items?IncludeItemTypes=Movie with no ParentId searches every
++// library at once. Undefined/unset just means "don't scope" (old
++// server-wide behavior), so this is safe to leave blank for setups
++// without a dedicated Adult library.
++export const moviesLibraryId = process.env.JELLYFIN_MOVIES_LIBRARY_ID
++export const showsLibraryId = process.env.JELLYFIN_SHOWS_LIBRARY_ID
++export const adultLibraryId = process.env.JELLYFIN_ADULT_LIBRARY_ID
++
+ export class JellyfinApi {
+ 
+     async authenticate() {
+@@ -15,7 +27,11 @@ export class JellyfinApi {
+             {Username: user, Pw: password}, {
+                 headers: {
+                     'Content-Type': 'application/json',
+-                    'X-Emby-Authorization': `MediaBrowser Client="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0""`
++                    // Jellyfin 12+ (upgraded from 10.11) dropped support for the legacy
++                    // X-Emby-Authorization/X-Emby-Token headers entirely; it now requires
++                    // the standard Authorization header, still using the MediaBrowser
++                    // scheme, for both login and all authenticated requests.
++                    'Authorization': `MediaBrowser Client="Jellyfin Stremio Addon", App="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0"`
+                 }
+             }).then(it => it.data)
+             .catch(err => {
+@@ -29,68 +45,222 @@ export class JellyfinApi {
+                 process.exit()
+             })
+         console.log(`Successfully connected to Jellyfin server: ${server}. Happy streaming.`)
+-        this.authorisationHeader = `MediaBrowser Client="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0", Token="${this.auth.AccessToken}"`
++        this.authorisationHeader = `MediaBrowser Client="Jellyfin Stremio Addon", App="Jellyfin Stremio Addon", Device="${device}", DeviceId="${device}", Version="1.0.0.0", Token="${this.auth.AccessToken}"`
+     }
+ 
+-    async getItemById(itemId) {
+-        return axios.get(`${server}/Users/${this.auth.User.Id}/Items/${itemId}`,
+-            {
++    // Jellyfin session tokens can be invalidated/rotated server-side at any
++    // time (server restart, session expiry, etc). Since authenticate() only
++    // ever runs once at process startup, every Jellyfin API call goes through
++    // this wrapper instead of calling axios.get directly: on a 401, it
++    // re-authenticates once (getting a fresh token + authorisationHeader)
++    // and retries the exact same request once before giving up. This lets
++    // the addon self-heal from a stale token without needing a manual
++    // service restart.
++    async authenticatedGet(url) {
++        try {
++            return await axios.get(url, {
++                headers: {
++                    'Content-Type': 'application/json',
++                    'Authorization': this.authorisationHeader
++                }
++            })
++        } catch (err) {
++            if (err?.response?.status !== 401) {
++                throw err
++            }
++            console.warn("Jellyfin returned 401 - re-authenticating and retrying once.")
++            await this.authenticate()
++            return axios.get(url, {
+                 headers: {
+                     'Content-Type': 'application/json',
+-                    'X-Emby-Authorization': this.authorisationHeader
++                    'Authorization': this.authorisationHeader
+                 }
+             })
++        }
++    }
++
++    async getItemById(itemId) {
++        return this.authenticatedGet(`${server}/Users/${this.auth.User.Id}/Items/${itemId}`)
+     }
+ 
+-    async searchItems(skip, movie, searchTerm = null) {
+-        let firstItem = Number(skip) + 1
+-        let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&startIndex=${firstItem}&limit=${itemsLimit}&sortBy=SortName`
++    // Fetches every Movie/Series in one shot (Fields=ProviderIds so
++    // itemToMeta in addon.js can tell which items have a matched IMDb id
++    // and which need the "jf<itemId>" fallback id - the list endpoint
++    // omits ProviderIds entirely unless explicitly requested, unlike the
++    // single-item endpoint getItemById used to hit per item), then
++    // paginates. No longer filters out items without an IMDb id (it used
++    // to, via hasImdb=true - which isn't reliably enforced server-side
++    // anyway, confirmed live: identical result counts with and without
++    // it): TheMovieDb fails to confidently match a meaningful fraction of
++    // real titles (most of Adult's library, some Shows), and those items
++    // were previously just invisible in every catalog rather than merely
++    // lacking IMDb-based extras. The whole library is small enough
++    // (~100-150 items) that fetching it in one request and paginating in
++    // memory is simpler and cheaper than the old per-item getItemById()
++    // N+1 calls it replaces. parentId scopes the search to one library
++    // (its Jellyfin ItemId) - omit it to search the whole server, as
++    // before.
++    async searchItems(skip, movie, searchTerm = null, parentId = null) {
++        let itemsSearch = `${server}/Items?userId=${this.auth.User.Id}&Recursive=true&Fields=ProviderIds,ImageTags&sortBy=SortName&IncludeItemTypes=${movie ? 'Movie' : 'Series'}`
+         if (searchTerm) {
+             itemsSearch += `&searchTerm=${searchTerm}`
+         }
++        if (parentId) {
++            itemsSearch += `&ParentId=${parentId}`
++        }
+ 
+-        if (movie) {
+-            itemsSearch += `&IncludeItemTypes=Movie`
+-        } else
+-            itemsSearch += `&IncludeItemTypes=Series`
+-
+-        return axios.get(itemsSearch,
+-            {
+-                headers: {
+-                    'Content-Type': 'application/json',
+-                    'X-Emby-Authorization': this.authorisationHeader
+-                }
+-            })
+-            .then(it => it.data.Items.map(it => this.getItemById(it.Id)))
++        return this.authenticatedGet(itemsSearch)
++            .then(it => it.data.Items.slice(Number(skip) || 0, (Number(skip) || 0) + itemsLimit))
+     }
+ 
+      getItemByImdbId(imdbId) {
+-        return axios.get(`${server}/ProvidersIdSearch?ProviderId=${imdbId}`,
+-            {
+-                headers: {
+-                    'Content-Type': 'application/json',
+-                    'X-Emby-Authorization': this.authorisationHeader
+-                }
+-            }).then(item => item.data)
++        // Native Jellyfin /Items API has no direct "find by external provider id" filter,
++        // so we search with Fields=ProviderIds and match client-side. This replaces the
++        // old jellyfin-providersid-search-plugin dependency, which is binary-incompatible
++        // with modern Jellyfin server versions (MissingMethodException on ILibraryManager).
++        return this.authenticatedGet(`${server}/Items?userId=${this.auth.User.Id}&hasImdb=true&Recursive=true&IncludeItemTypes=Movie,Series&Fields=ProviderIds,MediaSources,ImageTags`)
++            .then(res => res.data.Items.filter(it => it.ProviderIds && it.ProviderIds.Imdb === imdbId))
+     }
+ 
+-     getSeasonByParentItemIdAndSeasonNumber(itemId, seasonNumber) {
+-        return axios.get(`${server}/Shows/${itemId}/Seasons?userId=${this.auth.User.Id}`,
+-            {
+-                headers: {
+-                    'Content-Type': 'application/json',
+-                    'X-Emby-Authorization': this.authorisationHeader
+-                }
+-            }).then(item => item.data)
++    // Fallback lookup for items with no matched external provider id (TheMovieDb
++    // couldn't confidently identify the title - common for adult content and
++    // obscure/mistitled files). Returns the same shape as getItemByImdbId (an
++    // array, so callers can keep doing items[0] either way) so it's a drop-in
++    // alternative, not a special case every caller needs to branch on.
++    getItemByJellyfinId(itemId) {
++        return this.getItemById(itemId).then(res => [res.data]).catch(() => [])
+     }
+ 
+-     getEpisodeByItemIdAndSeasonId(itemId, seasonId) {
++    // Resolves a catalog item id that may be either a real IMDb id (tt-prefixed)
++    // or our own "jf<itemId>" fallback id (see itemToMeta in addon.js) - use this
++    // instead of getItemByImdbId anywhere a lookup used to assume every id was
++    // an IMDb id.
++    getItemByAnyId(id) {
++        if (id.startsWith('jf')) {
++            return this.getItemByJellyfinId(id.slice(2))
++        }
++        return this.getItemByImdbId(id)
++    }
+ 
+-        return axios.get(`${server}/Shows/${itemId}/Episodes?seasonId=${seasonId}&userId=${this.auth.User.Id}`,
+-            {
+-                headers: {
+-                    'Content-Type': 'application/json',
+-                    'X-Emby-Authorization': this.authorisationHeader                }
+-            }).then(item => item.data)
++    // Fire-and-forget: asks Jellyfin to (re)fetch images for an item with
++    // no Primary image yet, so its own already-configured image fetchers
++    // (embedded cover extraction, TheMovieDb, and - as a last resort -
++    // "Screen Grabber", which pulls a frame directly from the video file)
++    // get a chance to run. Deliberately not awaited by callers: a poster
++    // showing up a request or two later is a fine outcome, and this must
++    // never block or fail the catalog/meta response it was triggered from.
++    // Silently swallows failures - a corrupted file ffmpeg can't open at
++    // all (confirmed live: some real files in this library are, via
++    // "moov atom not found") has nothing any of these fetchers can
++    // extract from, so this is a best-effort backfill that self-heals the
++    // fixable cases and stays a harmless no-op for the unfixable ones.
++    refreshItemImages(itemId) {
++        axios.post(`${server}/Items/${itemId}/Refresh?metadataRefreshMode=None&imageRefreshMode=FullRefresh&replaceAllImages=false`, null, {
++            headers: {'Authorization': this.authorisationHeader}
++        }).catch(() => {})
++    }
++
++    // Builds one canonical (season, episode) numbering for every episode of
++    // a series - the single source of truth both defineMetaHandler (the
++    // browsable episode list Stremio's UI needs) and resolveEpisode (given
++    // a season+episode, find the Jellyfin item) use, so they can never
++    // disagree with each other. Handles two real, confirmed-live messy-
++    // library cases beyond a normally-organized show (which just keeps its
++    // real season/episode IndexNumbers unchanged):
++    //
++    // - A season with no IndexNumber ("Season Unknown" - Jellyfin's
++    //   catch-all when it can't group episodes, common for a show scanned
++    //   without season subfolders past season 1) gets folded into one
++    //   synthetic season numbered one past the highest real season number,
++    //   with its episodes numbered positionally (sorted by premiere date,
++    //   then name). This won't always match the show's real season
++    //   breakdown (e.g. seasons 2-4 of a show all lumped into one "season"
++    //   here), but keeps every episode browsable and playable instead of
++    //   invisible - a deliberate, disclosed trade-off, not a guarantee of
++    //   matching official numbering.
++    // - If a season has episodes with no IndexNumber at all (e.g. named
++    //   after the release group/site instead of the real title, so
++    //   Jellyfin's parser had nothing to extract), those also fall back to
++    //   positional numbering within that season.
++    async getCanonicalEpisodeList(seriesId) {
++        const seasons = (await this.authenticatedGet(`${server}/Shows/${seriesId}/Seasons?userId=${this.auth.User.Id}`)).data.Items
++        const episodesFor = async (seasonId) =>
++            (await this.authenticatedGet(`${server}/Shows/${seriesId}/Episodes?seasonId=${seasonId}&userId=${this.auth.User.Id}`)).data.Items
++        const sortEpisodes = (episodes) => [...episodes].sort((a, b) =>
++            (a.PremiereDate || '').localeCompare(b.PremiereDate || '') || (a.Name || '').localeCompare(b.Name || '')
++        )
++
++        const numberedSeasons = seasons
++            .filter(s => s.IndexNumber !== null && s.IndexNumber !== undefined)
++            .sort((a, b) => a.IndexNumber - b.IndexNumber)
++        const unnumberedSeasons = seasons.filter(s => s.IndexNumber === null || s.IndexNumber === undefined)
++
++        const result = []
++        let fallbackNumbered = 0
++
++        for (const season of numberedSeasons) {
++            const sorted = sortEpisodes(await episodesFor(season.Id))
++            // A real IndexNumber is only trustworthy if it's unique within
++            // this season - some messy batch releases (e.g. a "complete
++            // series + movies" torrent packaged as one item) give several
++            // unrelated files the same stray IndexNumber, which would
++            // otherwise collide into the same video id and hide all but one
++            // of them. Anything not uniquely numbered falls back to the
++            // next free positional slot instead, guaranteed not to clash
++            // with any real or already-assigned number in this season.
++            const indexCounts = {}
++            sorted.forEach(ep => {
++                if (ep.IndexNumber !== null && ep.IndexNumber !== undefined) {
++                    indexCounts[ep.IndexNumber] = (indexCounts[ep.IndexNumber] || 0) + 1
++                }
++            })
++            const usedNums = new Set()
++            let nextPositional = 1
++            sorted.forEach(item => {
++                const idx = item.IndexNumber
++                let episodeNum
++                // A real, uniquely-claimed index can still collide with a
++                // number an earlier item already took via the positional
++                // fallback below (order-dependent - the earlier item might
++                // sort first despite having no real index of its own), so
++                // usedNums has to be checked here too, not just in the
++                // fallback branch.
++                if (idx !== null && idx !== undefined && indexCounts[idx] === 1 && !usedNums.has(idx)) {
++                    episodeNum = idx
++                } else {
++                    while (usedNums.has(nextPositional)) nextPositional++
++                    episodeNum = nextPositional
++                    fallbackNumbered++
++                }
++                usedNums.add(episodeNum)
++                result.push({seasonNum: season.IndexNumber, episodeNum, item})
++            })
++        }
++
++        if (unnumberedSeasons.length > 0) {
++            const syntheticSeasonNum = numberedSeasons.length > 0
++                ? numberedSeasons[numberedSeasons.length - 1].IndexNumber + 1
++                : 1
++            let extra = []
++            for (const season of unnumberedSeasons) {
++                extra = extra.concat(await episodesFor(season.Id))
++            }
++            sortEpisodes(extra).forEach((item, i) => {
++                result.push({seasonNum: syntheticSeasonNum, episodeNum: i + 1, item})
++            })
++            console.warn(`[episode-numbering] ${seriesId}: ${unnumberedSeasons.map(s => s.Name).join(', ')} (${extra.length} episodes with no season number) folded into synthetic season ${syntheticSeasonNum}, numbered positionally - won't necessarily match this show's real season breakdown, but every episode stays browsable and playable. Fix at the source by fixing file/folder naming and re-scanning, if the real season split matters here.`)
++        }
++
++        if (fallbackNumbered > 0) {
++            console.warn(`[episode-numbering] ${seriesId}: ${fallbackNumbered} episode(s) had no usable or unique IndexNumber within their season and were numbered positionally (by premiere date/name) instead - a best-effort guess, not guaranteed to match the real episode order. Fix at the source by fixing file naming and re-scanning, if exact accuracy matters here.`)
++        }
++
++        return result
++    }
++
++    async resolveEpisode(seriesId, seasonNum, episodeNum) {
++        const list = await this.getCanonicalEpisodeList(seriesId)
++        const match = list.find(e => e.seasonNum === seasonNum && e.episodeNum === episodeNum)
++        return match ? match.item : undefined
+     }
+ }
+diff --git a/manifest.js b/manifest.js
+index 14d9457..188656a 100644
+--- a/manifest.js
++++ b/manifest.js
+@@ -1,45 +1,95 @@
+-export const manifest = {
+-    "id": "community.stremiojellyfin",
+-    "version": "1.0.0",
+-    "catalogs": [
+-        {
++// A config selects which of the three catalogs are shown. Each distinct
++// config is a genuinely separate installable Stremio addon (its own
++// manifest id, mounted at its own URL prefix - see server.js/addon.js),
++// since Stremio has no concept of reconfiguring an installed addon's
++// catalog list in place.
++export const CATALOG_KEYS = ["movies", "series", "adult"]
++
++export const ALL_ENABLED = {showMovies: true, showSeries: true, showAdult: true}
++
++// Every one of the 2^3 = 8 possible on/off combinations, generated rather
++// than listed by hand so adding a fourth toggle later is a one-line change
++// (add "showX" to configToSlug/createManifest) instead of rewriting a
++// hardcoded list.
++export const ALL_CONFIGS = []
++for (const showMovies of [true, false]) {
++    for (const showSeries of [true, false]) {
++        for (const showAdult of [true, false]) {
++            ALL_CONFIGS.push({showMovies, showSeries, showAdult})
++        }
++    }
++}
++
++// The "everything enabled" config lives at the root URL with no prefix
++// (backward compatible with the addon's original, single-manifest
++// behavior) - every other combination gets a URL prefix naming exactly
++// which catalogs it includes, e.g. "/movies-adult/manifest.json".
++export function configToSlug({showMovies, showSeries, showAdult}) {
++    const enabled = []
++    if (showMovies) enabled.push("movies")
++    if (showSeries) enabled.push("series")
++    if (showAdult) enabled.push("adult")
++    if (enabled.length === CATALOG_KEYS.length) return null
++    return enabled.length > 0 ? enabled.join("-") : "none"
++}
++
++export function createManifest(config) {
++    const {showMovies, showSeries, showAdult} = config
++    const catalogs = []
++    if (showMovies) {
++        catalogs.push({
+             "type": "movie",
+             "id": "all",
++            "name": "Jellyfin Movies",
+             "extra": [
+-                {
+-                    "name": "skip",
+-                    "isRequired": true
+-                },
+-                {
+-                    "name": "search",
+-                    "isRequired": false
+-                }
++                {"name": "skip", "isRequired": false},
++                {"name": "search", "isRequired": false}
+             ]
+-        },
+-        {
++        })
++    }
++    if (showSeries) {
++        catalogs.push({
+             "type": "series",
+             "id": "all",
++            "name": "Jellyfin Series",
++            "extra": [
++                {"name": "skip", "isRequired": false},
++                {"name": "search", "isRequired": false}
++            ]
++        })
++    }
++    if (showAdult) {
++        catalogs.push({
++            "type": "movie",
++            "id": "adult",
++            "name": "Adult",
+             "extra": [
+-                {
+-                    "name": "skip",
+-                    "isRequired": true
+-                },
+-                {
+-                    "name": "search",
+-                    "isRequired": false
+-                }
++                {"name": "skip", "isRequired": false},
++                {"name": "search", "isRequired": false}
+             ]
++        })
++    }
++    const slug = configToSlug(config)
++    return {
++        // Distinct per config so Stremio treats each combination as its
++        // own separate addon, not one addon being silently reconfigured -
++        // installing one doesn't touch or replace another.
++        "id": slug ? `community.stremiojellyfin.${slug.replace(/-/g, ".")}` : "community.stremiojellyfin",
++        "version": "1.0.0",
++        "catalogs": catalogs,
++        "resources": [
++            "catalog",
++            "stream",
++            "meta"
++        ],
++        "types": [
++            "movie",
++            "series"
++        ],
++        "name": slug ? `Jellyfin (${catalogs.map(c => c.name).join(", ") || "no catalogs"})` : "Jellyfin",
++        "description": "Stremio Jellyfin integration",
++        "behaviorHints": {
++            "configurable": true
+         }
+-    ],
+-    "resources": [
+-        "catalog",
+-        "stream",
+-        "meta"
+-    ],
+-    "types": [
+-        "movie",
+-        "series"
+-    ],
+-    "name": "Jellyfin",
+-    "description": "Stremio Jellyfin integration"
++    }
+ }
+diff --git a/package-lock.json b/package-lock.json
+index 690c8aa..f1579a0 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -10,6 +10,7 @@
+ 			"dependencies": {
+ 				"axios": "^1.6.5",
+ 				"es6-promise": "^4.2.8",
++				"express": "^4.16.3",
+ 				"stremio-addon-sdk": "1.1.x"
+ 			}
+ 		},
+diff --git a/package.json b/package.json
+index 51d942d..6043ce4 100644
+--- a/package.json
++++ b/package.json
+@@ -9,6 +9,7 @@
+ 	"dependencies": {
+ 		"axios": "^1.6.5",
+ 		"es6-promise": "^4.2.8",
++		"express": "^4.16.3",
+ 		"stremio-addon-sdk": "1.1.x"
+ 	}
+ }
+diff --git a/seerr.js b/seerr.js
+new file mode 100644
+index 0000000..331b422
+--- /dev/null
++++ b/seerr.js
+@@ -0,0 +1,194 @@
++import axios from "axios"
++
++// Seerr is the unified successor to Jellyseerr/Overseerr (the two projects
++// merged and were both deprecated in favor of Seerr, announced Feb 2026,
++// sunset end of May 2026 - see https://docs.seerr.dev/blog/seerr-release/).
++// Seerr's request API is a continuation of the same codebase/contract that
++// Overseerr and Jellyseerr have used for years:
++//   - Auth: `X-Api-Key` header (Settings -> General -> API Key in Seerr's UI)
++//   - POST /api/v1/request  { mediaType: "movie"|"tv", mediaId: <tmdbId>, seasons?: number[] | "all" }
++//
++// IMDB id -> TMDb id resolution does NOT go through Seerr's own /api/v1/search
++// (that's a plain title-text search against TMDb's /search/multi, confirmed
++// by reading Seerr's own source - server/routes/search.ts / server/api/
++// themoviedb/index.ts - it does not accept or match on external ids at all).
++// Seerr's backend has an internal getMediaByImdbId()/getByExternalId() helper
++// that wraps TMDb's real "find by external id" endpoint
++// (GET https://api.themoviedb.org/3/find/{imdbId}?external_source=imdb_id),
++// but that helper isn't exposed as its own public Seerr route - so this calls
++// TMDb's /find endpoint directly instead. The API key below
++// (431a8708161bcd1f1fbe7536137e61ed) is TMDb's own public "read" key that
++// Overseerr/Jellyseerr/Seerr ship hardcoded in their own open-source
++// repository (server/api/themoviedb/index.ts) - it's not a secret credential
++// tied to this deployment, and using it here avoids requiring a separate
++// TMDb account/key just for this one lookup.
++
++const seerrUrl = (process.env.SEERR_URL || "").replace(/\/+$/, "")
++const seerrApiKey = process.env.SEERR_API_KEY
++const tmdbApiKey = process.env.TMDB_API_KEY || "431a8708161bcd1f1fbe7536137e61ed"
++
++export class SeerrApi {
++    constructor() {
++        this.enabled = Boolean(seerrUrl && seerrApiKey)
++        if (!this.enabled) {
++            console.warn(
++                "SEERR_URL / SEERR_API_KEY not configured - 'Request via Seerr' streams will be disabled."
++            )
++            return
++        }
++        this.client = axios.create({
++            baseURL: seerrUrl,
++            headers: {
++                "X-Api-Key": seerrApiKey,
++                "Content-Type": "application/json"
++            },
++            timeout: 15000
++        })
++        this.tmdb = axios.create({
++            baseURL: "https://api.themoviedb.org/3",
++            params: { api_key: tmdbApiKey },
++            timeout: 15000
++        })
++        // Separate, much shorter timeout specifically for the optional
++        // "already requested?" pre-check (see #alreadyRequestedOrAvailable
++        // below). Live testing showed this endpoint occasionally hangs for
++        // the full 15s (Seerr likely busy processing an active download at
++        // the time), which pushed /request's total response time past 20s
++        // - itself defeating the whole point of responding fast. This is a
++        // nice-to-have optimization, not a correctness requirement (the
++        // in-memory lock is the primary guard against duplicates), so it's
++        // fine for it to fail/skip fast rather than block the request.
++        this.precheckClient = axios.create({
++            baseURL: seerrUrl,
++            headers: { "X-Api-Key": seerrApiKey },
++            timeout: 3000
++        })
++    }
++
++    // In-memory guard against duplicate requests. Seerr's own POST
++    // /api/v1/request duplicate check (server/entity/MediaRequest.ts) is a
++    // non-atomic SELECT-then-INSERT with no DB unique constraint and no
++    // locking - two POSTs close together can both pass the "does a request
++    // already exist" check before the first one's row is committed. Live
++    // testing confirmed this: two taps of "Request via Seerr" on the same
++    // title, 22 seconds apart, both created separate "Requested" entries in
++    // Seerr instead of the second one hitting a 409. This Set tracks
++    // tmdbId+mediaType combos requested recently by THIS addon process, so
++    // a repeat click within REQUEST_LOCK_MS is blocked before ever calling
++    // Seerr, regardless of whether Seerr's own dedup would have caught it.
++    // Not persisted across restarts (an in-memory Set), but that's fine -
++    // it only needs to cover the "user impatiently taps twice" case, not
++    // long-term dedup, since Seerr's GET-based pre-check below (checking
++    // mediaInfo.status/requests) handles the "already requested a while
++    // ago, in a previous process lifetime" case.
++    #recentRequests = new Map()
++    static REQUEST_LOCK_MS = 30 * 1000
++
++    #isRecentlyRequested(tmdbId, mediaType) {
++        const key = `${mediaType}:${tmdbId}`
++        const requestedAt = this.#recentRequests.get(key)
++        if (requestedAt === undefined) return false
++        if (Date.now() - requestedAt > SeerrApi.REQUEST_LOCK_MS) {
++            this.#recentRequests.delete(key)
++            return false
++        }
++        return true
++    }
++
++    #markRecentlyRequested(tmdbId, mediaType) {
++        this.#recentRequests.set(`${mediaType}:${tmdbId}`, Date.now())
++    }
++
++    // Checks Seerr's own record of this title's status/requests BEFORE
++    // submitting a new one - the reliable way to detect "already requested
++    // a while ago", since Seerr's POST-time 409 check is race-prone (see
++    // note above) and this addon process may have restarted since the
++    // original request (clearing the in-memory guard above).
++    async #alreadyRequestedOrAvailable(tmdbId, mediaType) {
++        try {
++            const endpoint = mediaType === "tv" ? `/api/v1/tv/${tmdbId}` : `/api/v1/movie/${tmdbId}`
++            const { data } = await this.precheckClient.get(endpoint)
++            const info = data?.mediaInfo
++            if (!info) return false
++            if (info.status === 5 || info.status === 4) return true // AVAILABLE / PARTIALLY_AVAILABLE
++            const requests = info.requests || []
++            return requests.some(r => r.status === 1 || r.status === 2) // PENDING / APPROVED
++        } catch (err) {
++            console.error("Seerr pre-check failed, proceeding to request anyway:", err?.message || err)
++            return false
++        }
++    }
++
++    // Resolves an IMDB id (e.g. "tt1234567") + Stremio type ("movie"/"series")
++    // to a TMDb id, via TMDb's own /find endpoint - the correct, exact
++    // external-id lookup (as opposed to Seerr's /search, which is text-only
++    // and won't reliably match a raw IMDB id string).
++    async findByImdbId(imdbId, stremioType) {
++        if (!this.enabled) return null
++        const mediaType = stremioType === "series" ? "tv" : "movie"
++
++        const { data } = await this.tmdb.get(`/find/${imdbId}`, {
++            params: { external_source: "imdb_id" }
++        })
++
++        const movieResult = data?.movie_results?.[0]
++        const tvResult = data?.tv_results?.[0]
++
++        if (mediaType === "movie" && movieResult) {
++            return { tmdbId: movieResult.id, mediaType: "movie" }
++        }
++        if (mediaType === "tv" && tvResult) {
++            return { tmdbId: tvResult.id, mediaType: "tv" }
++        }
++        // Fall back to whichever type TMDb actually matched, in case Stremio's
++        // type classification (movie vs series) disagrees with TMDb's - better
++        // to request the right title under the "wrong" type than fail outright.
++        if (movieResult) return { tmdbId: movieResult.id, mediaType: "movie" }
++        if (tvResult) return { tmdbId: tvResult.id, mediaType: "tv" }
++
++        return null
++    }
++
++    // Submits a request to Seerr. For TV, requests all seasons by default
++    // since Stremio's per-episode granularity doesn't map cleanly onto a
++    // one-click "request this show" action.
++    //
++    // Guards against duplicates two ways before ever POSTing (see the notes
++    // above on why Seerr's own 409 dedup isn't reliable enough alone):
++    //   1. In-memory recent-request lock (this addon process, last 30s)
++    //   2. A live check of Seerr's own mediaInfo.status/requests
++    // Only if both say "not already requested" does this actually POST.
++    async requestMedia(tmdbId, mediaType) {
++        if (!this.enabled) throw new Error("Seerr is not configured")
++
++        if (this.#isRecentlyRequested(tmdbId, mediaType)) {
++            return { alreadyRequested: true }
++        }
++
++        if (await this.#alreadyRequestedOrAvailable(tmdbId, mediaType)) {
++            this.#markRecentlyRequested(tmdbId, mediaType)
++            return { alreadyRequested: true }
++        }
++
++        const body = { mediaType, mediaId: tmdbId }
++        if (mediaType === "tv") body.seasons = "all"
++
++        try {
++            const { data } = await this.client.post("/api/v1/request", body)
++            this.#markRecentlyRequested(tmdbId, mediaType)
++            return data
++        } catch (err) {
++            // Still mark it, even on Seerr's own 409 - the race this addon
++            // can't fully close is other CLIENTS hitting Seerr directly
++            // (its own web UI, another integration), not this addon's own
++            // repeat clicks, which the guards above now prevent.
++            if (err?.response?.status === 409) {
++                this.#markRecentlyRequested(tmdbId, mediaType)
++                return { alreadyRequested: true }
++            }
++            throw err
++        }
++    }
++}
++
++export const seerr = new SeerrApi()
+diff --git a/server.js b/server.js
+index d5e1f85..9f6a4c0 100644
+--- a/server.js
++++ b/server.js
+@@ -1,7 +1,277 @@
++import path from "path"
++import { fileURLToPath } from "url"
++import express from "express"
+ import stremio from "stremio-addon-sdk"
+-import {addonInterface} from "./addon.js"
++import {interfacesBySlug, buildJellyfinStreamUrl, resolveJellyfinItem, isRequestableItemId} from "./addon.js"
++import {ALL_CONFIGS, configToSlug} from "./manifest.js"
++import {seerr} from "./seerr.js"
+ 
+-const { serveHTTP, publishToCentral } = stremio
++// We build our own Express app (instead of using serveHTTP directly) so we
++// can add the /request route below, which serveHTTP has no hook for. This
++// mirrors serveHTTP's own implementation (getRouter mounted on an express
++// app) - see stremio-addon-sdk/src/serveHTTP.js.
++const { getRouter } = stremio
+ 
+-serveHTTP(addonInterface, { port: process.env.SERVER_PORT || 60421 })
++const app = express()
+ 
++// One genuinely separate installable addon per config (see manifest.js/
++// addon.js) - the all-enabled config mounts at the root URL, unchanged
++// from before this feature existed, so any existing install keeps working
++// exactly as it did. Every other combination of Movies/Series/Adult gets
++// its own URL prefix naming exactly which catalogs it includes (e.g.
++// /movies-adult), with that catalog left out of its manifest entirely -
++// not just hidden client-side.
++for (const config of ALL_CONFIGS) {
++    const slug = configToSlug(config)
++    const iface = interfacesBySlug.get(slug || "")
++    if (slug) {
++        app.use(`/${slug}`, getRouter(iface))
++    } else {
++        app.use(getRouter(iface))
++    }
++}
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url))
++const PLACEHOLDER_VIDEO_PATH = path.join(__dirname, "assets", "requested-placeholder.mp4")
++
++// DESIGN NOTE - why this endpoint does NOT poll or hold the connection open:
++//
++// Two earlier designs were tried and both proven broken by real player
++// constraints:
++//   1. Holding one HTTP connection open for up to 5 minutes while polling
++//      Jellyfin internally, responding once ready/timed out. Broken because
++//      real player HTTP clients have short idle-read timeouts - confirmed
++//      via Nuvio's own source (PlayerPlaybackNetworking.kt): OkHttp
++//      connect/read/write timeout = 15 seconds, with ExoPlayer's own
++//      retry/backoff policy giving up entirely around 90-100s. A silent
++//      connection blows past that on the very first request.
++//   2. Responding fast every time via a redirect-loop (302 back to this
++//      same endpoint every few seconds until ready). Broken because both
++//      major player HTTP stacks cap the number of redirects they'll follow
++//      in one logical request: OkHttp hard-caps at 20 follow-ups
++//      (RetryAndFollowUpInterceptor.MAX_FOLLOW_UPS), and ffmpeg/mpv's
++//      libavformat caps at 8 by default (HTTP_MAX_REDIRECTS_DEFAULT) - a
++//      5-minute wait at a few seconds per hop needs 70+ hops, which fails
++//      on both far before the timeout is ever reached.
++//
++// No single HTTP response can both stay open for minutes AND later swap to
++// a different real video file - players don't support hot-swapping content
++// mid-stream. So instead: this endpoint responds immediately (a fast,
++// normal file response), submits the Seerr request, and serves a short
++// static placeholder video explaining what's happening. The user reopens
++// the title later (once it's downloaded) - at that point `defineStreamHandler`
++// in addon.js finds the real Jellyfin item on its normal fast path and
++// returns the actual stream, same as any title that was already in the
++// library. No auto-transition mid-playback, but nothing hangs or errors.
++function escapeHtml(str) {
++    return String(str).replace(/[&<>"']/g, (c) => ({
++        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
++    })[c])
++}
++
++function renderErrorPage(title, message) {
++    return `<!DOCTYPE html>
++<html>
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <title>${escapeHtml(title)}</title>
++  <style>
++    body { font-family: -apple-system, sans-serif; background: #0f1115; color: #eee; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; box-sizing: border-box; }
++    .card { max-width: 420px; text-align: center; }
++    h1 { font-size: 1.3rem; margin-bottom: 12px; color: #ff6b6b; }
++    p { color: #aaa; line-height: 1.5; }
++  </style>
++</head>
++<body>
++  <div class="card">
++    <h1>${escapeHtml(title)}</h1>
++    <p>${escapeHtml(message)}</p>
++  </div>
++</body>
++</html>`
++}
++
++// Simple, self-contained configure page (no build step/framework in this
++// app, matching renderErrorPage's approach above): one checkbox per
++// catalog (Movies/Series/Adult), and an Install button that computes the
++// right config's manifest URL client-side (mirroring configToSlug's own
++// rule: all three enabled means the root, un-prefixed URL) and hands it to
++// Stremio. Reachable at /configure and every /<slug>/configure (one per
++// non-root config - see the mounting loop below) - Stremio's own
++// "reconfigure" flow for an already-installed addon opens
++// <manifest-base>/configure, so whichever config's prefix the user is
++// already on renders here with that combination pre-checked. Since every
++// config is a genuinely separate addon (distinct manifest id - see
++// manifest.js), changing checkboxes and reinstalling adds/replaces that
++// *other* addon rather than converting this one in place - Stremio has no
++// concept of changing an installed addon's id.
++function renderConfigurePage(config) {
++    const {showMovies, showSeries, showAdult} = config
++    return `<!DOCTYPE html>
++<html>
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <title>Configure Jellyfin Addon</title>
++  <style>
++    body { font-family: -apple-system, sans-serif; background: #0f1115; color: #eee; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; box-sizing: border-box; }
++    .card { max-width: 420px; width: 100%; text-align: center; }
++    h1 { font-size: 1.4rem; margin-bottom: 24px; }
++    label { display: flex; align-items: center; gap: 10px; justify-content: center; margin-bottom: 16px; font-size: 1.05rem; cursor: pointer; }
++    input[type=checkbox] { width: 20px; height: 20px; cursor: pointer; }
++    button { font-size: 1rem; padding: 12px 28px; border-radius: 8px; border: none; background: #7b5bf5; color: #fff; cursor: pointer; margin-top: 12px; }
++    button:hover { background: #6a4be0; }
++    .manifest-url { margin-top: 20px; font-size: 0.8rem; color: #888; word-break: break-all; }
++    .manifest-url a { color: #9b8cf0; }
++  </style>
++</head>
++<body>
++  <div class="card">
++    <h1>Jellyfin Stremio Addon</h1>
++    <label><input type="checkbox" id="showMovies" ${showMovies ? "checked" : ""}> Show Movies catalog</label>
++    <label><input type="checkbox" id="showSeries" ${showSeries ? "checked" : ""}> Show TV Series catalog</label>
++    <label><input type="checkbox" id="showAdult" ${showAdult ? "checked" : ""}> Show Adult catalog</label>
++    <button onclick="install()">Install in Stremio</button>
++    <div class="manifest-url">Manifest URL: <a id="manifestLink" href="#"></a></div>
++  </div>
++  <script>
++    // Mirrors configToSlug in manifest.js: all three enabled means the
++    // root, un-prefixed manifest URL; every other combination gets a
++    // prefix naming exactly which catalogs are on.
++    function configSlug(movies, series, adult) {
++      const enabled = []
++      if (movies) enabled.push('movies')
++      if (series) enabled.push('series')
++      if (adult) enabled.push('adult')
++      if (enabled.length === 3) return ''
++      return enabled.length > 0 ? enabled.join('-') : 'none'
++    }
++    function manifestPath() {
++      const movies = document.getElementById('showMovies').checked
++      const series = document.getElementById('showSeries').checked
++      const adult = document.getElementById('showAdult').checked
++      const slug = configSlug(movies, series, adult)
++      return (slug ? '/' + slug : '') + '/manifest.json'
++    }
++    function manifestHttpUrl() {
++      return window.location.origin + manifestPath()
++    }
++    function updateLink() {
++      const el = document.getElementById('manifestLink')
++      el.href = manifestHttpUrl()
++      el.textContent = manifestHttpUrl()
++    }
++    function install() {
++      window.location.href = 'stremio://' + window.location.host + manifestPath()
++    }
++    for (const id of ['showMovies', 'showSeries', 'showAdult']) {
++      document.getElementById(id).addEventListener('change', updateLink)
++    }
++    updateLink()
++  </script>
++</body>
++</html>`
++}
++
++for (const config of ALL_CONFIGS) {
++    const slug = configToSlug(config)
++    app.get(slug ? `/${slug}/configure` : "/configure", (req, res) => {
++        res.setHeader("content-type", "text/html; charset=utf-8")
++        res.end(renderConfigurePage(config))
++    })
++}
++
++// This is the URL served as the "Request via Seerr" stream.url itself - NOT
++// a webpage the user browses to, but an endpoint a video player opens
++// directly, exactly like it would open any other stream URL. See the
++// DESIGN NOTE above for why this responds immediately rather than waiting.
++app.get("/request/:type/:imdbId/:season?/:episode?", async (req, res) => {
++    const { type, imdbId, season, episode } = req.params
++
++    // If the title happens to already be available (e.g. the user is
++    // reopening this same title after it finished downloading, and Stremio/
++    // Nuvio's addon cache hasn't refreshed yet), skip straight to the real
++    // stream instead of submitting a redundant Seerr request and showing
++    // the placeholder unnecessarily.
++    try {
++        const item = await resolveJellyfinItem(type, imdbId, season, episode)
++        if (item) {
++            const streamUrl = buildJellyfinStreamUrl(item)
++            if (streamUrl) {
++                return res.redirect(302, streamUrl)
++            }
++        }
++    } catch (err) {
++        console.error("request availability check failed:", err?.message || err)
++        // fall through - still try to submit the Seerr request below
++    }
++
++    if (!seerr.enabled) {
++        res.status(503)
++        res.setHeader("content-type", "text/html; charset=utf-8")
++        return res.end(renderErrorPage(
++            "Seerr not configured",
++            "This addon's SEERR_URL / SEERR_API_KEY are not set, so requests can't be submitted."
++        ))
++    }
++
++    // Belt-and-suspenders: defineStreamHandler never offers this URL
++    // unless the id is known, catalogued mainstream Jellyfin content (see
++    // isRequestableItemId in addon.js) - not Adult content, and not an id
++    // from some other addon entirely - but refuse here too in case a
++    // client held onto a stale stream URL from before that exclusion
++    // took effect.
++    if (!isRequestableItemId(imdbId)) {
++        res.status(403)
++        res.setHeader("content-type", "text/html; charset=utf-8")
++        return res.end(renderErrorPage(
++            "Not requestable",
++            "This title isn't recognized as requestable mainstream Jellyfin content."
++        ))
++    }
++
++    try {
++        const match = await seerr.findByImdbId(imdbId, type)
++        if (!match) {
++            res.status(404)
++            res.setHeader("content-type", "text/html; charset=utf-8")
++            return res.end(renderErrorPage(
++                "Couldn't find this title on Seerr",
++                `No match found for IMDB id ${imdbId}. It may not be indexed on TMDb, or the title metadata differs.`
++            ))
++        }
++
++        // requestMedia() itself now guards against duplicates (an in-memory
++        // recent-request lock plus a live Seerr status check - see
++        // seerr.js), so it only throws for genuine failures now, returning
++        // normally (with alreadyRequested: true) for both "just requested"
++        // and "already requested" cases. Either way, fall through to
++        // serving the placeholder below.
++        await seerr.requestMedia(match.tmdbId, match.mediaType)
++    } catch (err) {
++        console.error("Seerr request failed:", err?.response?.data || err?.message || err)
++        res.status(502)
++        res.setHeader("content-type", "text/html; charset=utf-8")
++        return res.end(renderErrorPage(
++            "Request failed",
++            "Something went wrong submitting this request to Seerr. Check the addon logs for details."
++        ))
++    }
++
++    // Request submitted (or already was) - respond immediately with the
++    // placeholder video. This is a normal, fast, complete file response
++    // (not a hanging connection), so it can't trip any player's read
++    // timeout. The user reopens this title later, once it's actually
++    // downloaded, to get the real stream.
++    return res.sendFile(PLACEHOLDER_VIDEO_PATH, (err) => {
++        if (err && !res.headersSent) {
++            console.error("Failed to send placeholder video:", err?.message || err)
++        }
++    })
++})
++
++const port = process.env.SERVER_PORT || 60421
++app.listen(port, () => {
++    console.log(`HTTP addon accessible at: http://127.0.0.1:${port}/manifest.json`)
++})
+-- 
+2.47.3
+
